@@ -67,8 +67,8 @@ def limit_cost(
     """Computes the residual penalizing joint limit violations."""
     joint_cfg = vals[joint_var]
     joint_cfg_eff = robot.joints.get_full_config(joint_cfg)
-    residual_upper = jnp.maximum(0.0, joint_cfg_eff - robot.joints.upper_limits_all)
-    residual_lower = jnp.maximum(0.0, robot.joints.lower_limits_all - joint_cfg_eff)
+    residual_upper = jnp.maximum(0.0, joint_cfg_eff - robot.joints.upper_limits_all)**2
+    residual_lower = jnp.maximum(0.0, robot.joints.lower_limits_all - joint_cfg_eff)**2
     return ((residual_upper + residual_lower) * weight).flatten()
 
 
@@ -98,7 +98,7 @@ def rest_cost(
     weight: Array | float,
 ) -> Array:
     """Computes the residual biasing joints towards a rest pose."""
-    return ((vals[joint_var] - rest_pose) * weight).flatten()
+    return ((vals[joint_var] - rest_pose)**2 * weight).flatten()
 
 
 @Cost.create_factory
@@ -194,9 +194,15 @@ def world_collision_cost(
 ) -> Array:
     """Computes the residual penalizing world collisions below a margin."""
     cfg = vals[joint_var]
+    # jax.debug.print("cfg: {x}", x=cfg)
     dist_matrix = robot_coll.compute_world_collision_distance(robot, cfg, world_geom)
     residual = colldist_from_sdf(dist_matrix, margin)
-    return (residual * weight).flatten()
+    res = (residual * weight).flatten()
+    # jax.debug.print("dist_matrix: {x}", x=dist_matrix)
+    # jax.debug.print("dist_cost: {x}", x=residual)
+    # jax.debug.print("res: {x}", x=res)
+    return res
+    # return (residual * weight).flatten()
 
 
 # --- Finite Difference Costs (Velocity, Acceleration, Jerk) ---

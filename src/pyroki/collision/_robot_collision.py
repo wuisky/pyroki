@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 
 from .._robot_urdf_parser import RobotURDFParser
 from ._collision import collide, pairwise_collide
-from ._geometry import Capsule, CollGeom
+from ._geometry import Capsule, CollGeom, Sphere
 
 
 @jdc.pytree_dataclass
@@ -180,6 +180,7 @@ class RobotCollision:
                     radius=geom.cylinder.radius, height=geom.cylinder.length
                 )
             elif geom.sphere is not None:
+                # print(f'{link_name}, {geom.sphere.radius}')
                 mesh = trimesh.creation.icosphere(radius=geom.sphere.radius)
             elif geom.mesh is not None:
                 try:
@@ -231,6 +232,147 @@ class RobotCollision:
 
         coll_mesh = sum(coll_meshes, trimesh.Trimesh())
         return coll_mesh
+
+    @staticmethod
+    def from_urdf_spheres(
+        urdf: yourdfpy.URDF,
+        user_ignore_pairs: tuple[tuple[str, str], ...] = (),
+        ignore_immediate_adjacents: bool = True,
+    ):
+        """
+        Build a differentiable robot collision model from a URDF.
+
+        Args:
+            urdf: The URDF object (used to load collision meshes).
+            user_ignore_pairs: Additional pairs of link names to ignore for self-collision.
+            ignore_immediate_adjacents: If True, automatically ignore collisions
+                between adjacent (parent/child) links based on the URDF structure.
+        """
+        # Re-load urdf with collision data if not already loaded.
+        filename_handler = urdf._filename_handler  # pylint: disable=protected-access
+        try:
+            has_collision = any(link.collisions for link in urdf.link_map.values())
+            if not has_collision:
+                urdf = yourdfpy.URDF(
+                    robot=urdf.robot,
+                    filename_handler=filename_handler,
+                    load_collision_meshes=True,
+                )
+        except Exception as e:
+            logger.warning(f"Could not reload URDF with collision meshes: {e}")
+
+        _, link_info = RobotURDFParser.parse(urdf)
+        link_name_list = link_info.names  # Use names from parser
+
+        # # Gather all collision meshes.
+        # # The order of cap_list must match link_name_list.
+        # sphere_list = list[Sphere]()
+        # for link_name in link_name_list:
+        #     sphere_list.append(_get_sphere_collision_geometries(urdf, link_name))
+
+        # # Convert list of trimesh objects into a batched Capsule object.
+        # spheres = cast(Sphere, jax.tree.map(lambda *args: jnp.stack(args), *sphere_list))
+
+        # sphere_list = []
+        # for link_name in link_name_list:
+        #     s = RobotCollision._get_sphere_collision_geometries(urdf, link_name)
+        #     if s is None:
+        #         s = Sphere.from_center_and_radius(jnp.zeros(3), 0.0)
+        #     sphere_list.append(s)
+
+        # spheres = cast(Sphere, jax.tree.map(lambda *args: jnp.stack(args),
+        #                                     *sphere_list))
+        # まず各リンクの球数を調べる
+        num_spheres_per_link = []
+        for link_name in link_name_list:
+            s = RobotCollision._get_sphere_collision_geometries(urdf, link_name)
+            if s is None:
+                num_spheres_per_link.append(0)
+            else:
+                num_spheres_per_link.append(s.get_batch_axes()[0])
+        max_spheres = max(num_spheres_per_link)
+
+        # 各リンクの球をmax_spheres個に揃えてリスト化
+        sphere_list = []
+        for link_name in link_name_list:
+            s = RobotCollision._get_sphere_collision_geometries(urdf, link_name)
+            if s is None or s.get_batch_axes()[0] == 0:
+                # ダミー
+                center = jnp.zeros((max_spheres, 3), dtype=jnp.float32)
+                radius = jnp.zeros((max_spheres,), dtype=jnp.float32)
+                s = Sphere.from_center_and_radius(center, radius)
+            else:
+                # パディング
+                n = s.get_batch_axes()[0]
+                if n < max_spheres:
+                    pad = max_spheres - n
+                    center = jnp.concatenate([s.pose.translation(), jnp.zeros(
+                        (pad, 3), dtype=s.pose.translation().dtype)], axis=0)
+                    radius = jnp.concatenate(
+                        [s.radius, jnp.zeros((pad,), dtype=s.radius.dtype)], axis=0)
+                    s = Sphere.from_center_and_radius(center, radius)
+            sphere_list.append(s)
+
+        spheres = cast(Sphere, jax.tree.map(lambda *args: jnp.stack(args), *sphere_list))
+        # assert spheres.get_batch_axes() == (link_info.num_links,)
+        print(f'{spheres.get_batch_axes()=}')
+
+        # Directly compute active pair indices
+        active_idx_i, active_idx_j = RobotCollision._compute_active_pair_indices(
+            link_names=link_name_list,
+            urdf=urdf,
+            user_ignore_pairs=user_ignore_pairs,
+            ignore_immediate_adjacents=ignore_immediate_adjacents,
+        )
+
+        logger.info(
+            f"Created RobotCollision with {link_info.num_links} links and "
+            f"{len(active_idx_i)} active self-collision pairs."
+        )
+
+        return RobotCollision(
+            num_links=link_info.num_links,
+            link_names=link_name_list,
+            active_idx_i=active_idx_i,
+            active_idx_j=active_idx_j,
+            coll=spheres,
+        )
+
+    @staticmethod
+    def _get_sphere_collision_geometries(
+        urdf: yourdfpy.URDF, link_name: str
+    ) -> Sphere | None:
+        """Extracts sphere collision geometries for a given link name, applying relative transforms."""
+        link = urdf.link_map[link_name]
+        radius = []
+        pts = []
+
+        for collision in link.collisions:
+            geom = collision.geometry
+
+            # Get the transform of the collision geometry relative to the link frame
+            if collision.origin is not None:
+                transform = collision.origin
+                pts.append(transform[:3, 3])
+            else:
+                transform = jaxlie.SE3.identity().as_matrix()
+                pts.append(transform[:3, 3])
+
+            if geom.sphere is not None:
+                radius.append(geom.sphere.radius)
+            else:
+                logger.warning(
+                    f"No sphere geometry type for link '{link_name}'."
+                )
+                continue
+
+        if radius:
+            spheres = Sphere.from_center_and_radius(center=jnp.array(pts), radius=jnp.array(radius))
+            # print(f'{jnp.array(pts).shape=} {jnp.array(radius).shape=}' )
+            print(f'{link_name}: {spheres.get_batch_axes()=}')
+            return spheres
+        else:
+            return None
 
     @jdc.jit
     def at_config(

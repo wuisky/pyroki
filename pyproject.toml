@@ -25,12 +25,21 @@ dependencies = [
     "jax_dataclasses>=1.0.0",
     "jaxtyping",
     "loguru",
-    "robot_descriptions",
+    "robot-descriptions",
     "jaxls @ git+https://github.com/brentyi/jaxls.git",
     "yourdfpy",
     "trimesh",
     "viser",
-    "pyliblzfse",  # Need for viser.extras import in viser==0.2.23 
+    "pyliblzfse", # Need for viser.extras import in viser==0.2.23
+    "jaxopt>=0.8.5",
+    "ipython>=8.37.0",
+    "tqdm>=4.67.1",
+    "opencv-python>=4.11.0.86",
+    "transforms3d>=0.4.2",
+    "matplotlib>=3.10.6",
+    "urchin>=0.0.29",
+    "pytorch-kinematics>=0.7.0",
+    "arm-pytorch-utilities>=0.4.3",
 ]
 
 [project.optional-dependencies]

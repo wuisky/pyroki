@@ -6,19 +6,23 @@ Run online planning in collision aware environments.
 import time
 
 import numpy as np
-import pyroki as pk
+import pyroki_snippets as pks
 import viser
-from pyroki.collision import HalfSpace, RobotCollision, Sphere
 from robot_descriptions.loaders.yourdfpy import load_robot_description
 from viser.extras import ViserUrdf
 
-import pyroki_snippets as pks
+import pyroki as pk
+from pyroki.collision import HalfSpace, RobotCollision, Sphere
 
 
 def main():
     """Main function for online planning with collision."""
     urdf = load_robot_description("panda_description")
     target_link_name = "panda_hand"
+
+    # urdf = load_robot_description("ur5_description")
+    # target_link_name = "ee_link"
+
     robot = pk.Robot.from_urdf(urdf)
 
     robot_coll = RobotCollision.from_urdf(urdf)
@@ -46,7 +50,8 @@ def main():
     sphere_handle = server.scene.add_transform_controls(
         "/obstacle", scale=0.2, position=(0.4, 0.3, 0.4)
     )
-    server.scene.add_mesh_trimesh("/obstacle/mesh", mesh=sphere_coll.to_trimesh())
+    server.scene.add_mesh_trimesh(
+        "/obstacle/mesh", mesh=sphere_coll.to_trimesh())
     target_frame_handle = server.scene.add_batched_axes(
         "target_frame",
         axes_length=0.05,
@@ -58,9 +63,13 @@ def main():
     timing_handle = server.gui.add_number("Elapsed (ms)", 0.001, disabled=True)
 
     sol_pos, sol_wxyz = None, None
+    # noneつけると[1,6]のshapeになる
     sol_traj = np.array(
         robot.joint_var_cls.default_factory()[None].repeat(len_traj, axis=0)
     )
+    print(f'{robot.links.names=}')
+    print(f'{sol_traj=}')
+
     while True:
         start_time = time.time()
 
@@ -85,22 +94,28 @@ def main():
 
         # Update timing handle.
         timing_handle.value = (
-            0.99 * timing_handle.value + 0.01 * (time.time() - start_time) * 1000
+            0.99 * timing_handle.value + 0.01 *
+            (time.time() - start_time) * 1000
         )
 
         # Update visualizer.
         urdf_vis.update_cfg(
             sol_traj[0]
         )  # The first step of the online trajectory solution.
+        # print(f'{sol_traj=}') # in shape [len_traj, num_joints]
 
         # Update the planned trajectory visualization.
         if hasattr(target_frame_handle, "batched_positions"):
-            target_frame_handle.batched_positions = np.array(sol_pos)  # type: ignore[attr-defined]
-            target_frame_handle.batched_wxyzs = np.array(sol_wxyz)  # type: ignore[attr-defined]
+            target_frame_handle.batched_positions = np.array(
+                sol_pos)  # type: ignore[attr-defined]
+            target_frame_handle.batched_wxyzs = np.array(
+                sol_wxyz)  # type: ignore[attr-defined]
         else:
             # This is an older version of Viser.
-            target_frame_handle.positions_batched = np.array(sol_pos)  # type: ignore[attr-defined]
-            target_frame_handle.wxyzs_batched = np.array(sol_wxyz)  # type: ignore[attr-defined]
+            target_frame_handle.positions_batched = np.array(
+                sol_pos)  # type: ignore[attr-defined]
+            target_frame_handle.wxyzs_batched = np.array(
+                sol_wxyz)  # type: ignore[attr-defined]
 
 
 if __name__ == "__main__":

@@ -43,6 +43,9 @@ def solve_online_planning(
         timesteps,
         dt,
         jnp.array(start_cfg),
+        # オンラインプランニングやトラジェクトリ最適化で「1ステップ先まで必要」な場合や、
+        # 「境界条件を満たす」ためによく使われます。例えば、速度や加速度の差分計算で
+        # 「末尾の値が足りない」場合に、末尾を複製して長さを合わせる用途です
         jnp.concatenate([prev_sols, prev_sols[-1:]], axis=0),
     )
     sol_traj = sol_traj[1:]
@@ -64,13 +67,15 @@ def _solve_online_planning_jax(
     start_cfg: jnp.ndarray,
     prev_sols: jnp.ndarray,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    num_targets = len(target_links)
+    num_targets = len(target_links)  # 1
+    jax.debug.print("num_targets: {x}", x=target_links)
 
     def batched_rplus(
         pose: jaxlie.SE3,
         delta: jax.Array,
     ) -> jaxlie.SE3:
         return jax.vmap(jaxlie.manifold.rplus)(pose, delta.reshape(num_targets, -1))
+    # `delta` 配列の形を「(num_targets, 6)」のように「バッチ数 × 各姿勢の次元数」に並べ直す処理**です。
 
     # Custom SE3 variable to batch across multiple joint targets.
     # This is not to be confused with SE3Vars with ids, which we use here for timesteps.
@@ -80,6 +85,7 @@ def _solve_online_planning_jax(
         retract_fn=batched_rplus,
         tangent_dim=jaxlie.SE3.tangent_dim * num_targets,
     ): ...
+    # jaxlie.SE3.tangent_dim  ==
 
     # --- Define Variables ---
     traj_var = robot.joint_var_cls(jnp.arange(0, timesteps))
@@ -88,12 +94,12 @@ def _solve_online_planning_jax(
     pose_var = BatchedSE3Var(jnp.arange(0, timesteps))
     pose_var_prev = BatchedSE3Var(jnp.arange(0, timesteps - 1))
     pose_var_next = BatchedSE3Var(jnp.arange(1, timesteps))
-
+    # target linkの時系列pose抽出
     init_pose_vals = jaxlie.SE3(
         robot.forward_kinematics(prev_sols)[..., target_links, :]
     )
 
-    # --- Define Costs ---
+    # --- Define Costs ---traj_var
     factors: list[jaxls.Cost] = []  # Changed type hint to jaxls.Cost
 
     @jaxls.Cost.create_factory(name="SE3PoseMatchJointCost")
@@ -149,7 +155,7 @@ def _solve_online_planning_jax(
     )
 
     # Need to constrain the start joint cfg.
-    factors.append(match_start_pose_cost(robot.joint_var_cls(0)))
+    factors.append(match_start_pose_cost(robot.joint_var_cls(0)))  # tarj_var[0] 同じ？
 
     # Add joint costs.
     factors.extend(
