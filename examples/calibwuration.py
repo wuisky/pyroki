@@ -208,10 +208,13 @@ def main():
             s.value = q
 
     snapshot_cache = None
+    snapshot_btn = None
     @server.on_client_connect
     def _(client: viser.ClientHandle) -> None:
+        nonlocal snapshot_btn
         snapshot_btn = client.gui.add_button(
             label='撮像',  # ボタンに表示されるテキスト
+            disabled = True,
         )
         # 画像更新ボタン
         calib_btn = client.gui.add_button(
@@ -252,10 +255,11 @@ def main():
                     format="jpeg"
                 )
 
-                client.gui.add_markdown('再撮像しない場合、カメラの位置を調整して計算マスク'
-                                        'を写真のロボットのシルエット'
+                client.gui.add_markdown('再撮像しない場合、カメラの位置を調整して'
+                                        '赤いシルエットを写真のロボットのシルエット'
                                         'に大体合うようにしてから'
-                                        'キャリブレーション開始を押してください')
+                                        'キャリブレーション開始を押してください。'
+                                        '本当に大体でいいから')
 
                 def run_sam():
                     modal.close()
@@ -308,7 +312,7 @@ def main():
             # キャリブレーション開始の通知
             calib_notif = client.add_notification(
                 title="キャリブレーション実行中",
-                body="ロボットマスクを計算しています...",
+                body="キャリブレーション計算しています...",
                 loading=True,
                 with_close_button=False,
             )
@@ -319,29 +323,16 @@ def main():
             calib_notif.remove()
             client.add_notification(
                 title="キャリブレーション完了",
-                body="マスク計算が完了しました。",
+                body="キャリブレーション計算が完了しました。",
                 auto_close_seconds=4,
             )
 
 
     # PIL画像の表示例
-    # 1. NumPy配列からPIL画像を作成
     img_array = np.random.randint(0, 256, size=(200, 200, 3), dtype=np.uint8)
     pil_image = Image.fromarray(img_array)
-
-    # 2. PIL画像をnumpy配列に変換してViserで表示（3Dシーン内）
     img_np = np.array(pil_image)
-    # server.scene.add_image(
-    #     "/pil_image_3d",
-    #     image=img_np,
-    #     render_width=1.0,
-    #     render_height=1.0,
-    #     format="png",
-    #     position=(0.0, 0.0, 1.0),
-    #     wxyz=(1.0, 0.0, 0.0, 0.0)
-    # )
 
-    # 3. GUI内での画像表示
     with server.gui.add_folder("Images"):
         # JPG画像表示用のハンドル
         jpg_image_handle = server.gui.add_image(
@@ -419,6 +410,7 @@ def main():
     ######## callback
     @update_joint_btn.on_click
     def _(_) -> None:
+        nonlocal snapshot_btn
         th_deg = [-99.57, -149.865, -61.46, 0.0, 90.0, 0.0]
         th_rad = [np.deg2rad(angle) for angle in th_deg]
         urdf_vis.update_cfg(th_rad)
@@ -426,26 +418,7 @@ def main():
         #    slider.value = angle_rad
         for _, (slider, angle_rad) in enumerate(zip(slider_handles, th_rad)):
             slider.value = angle_rad
-
-        # # 新しいランダム画像を生成
-        # new_img_array = np.random.randint(0, 256, size=(200, 200, 3), dtype=np.uint8)
-        # new_pil_image = Image.fromarray(new_img_array)
-        # new_img_np = np.array(new_pil_image)
-
-        # # # 3Dシーン内の画像を更新
-        # # server.scene.add_image(
-        # #     "/pil_image_3d",
-        # #     image=new_img_np,
-        # #     render_width=1.0,
-        # #     render_height=1.0,
-        # #     format="png",
-        # #     position=(0.0, 0.0, 1.0),
-        # #     wxyz=(1.0, 0.0, 0.0, 0.0)
-        # # )
-
-        # # GUI内の画像を更新
-        # gui_image_handle.image = new_img_np
-        # print("画像を更新しました")
+        snapshot_btn.disabled = False
 
     @obj_handle.on_update
     def _(_) -> None:
