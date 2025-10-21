@@ -3,6 +3,7 @@
 Run online planning in collision aware environments.
 """
 
+import subprocess
 import time
 from pathlib import Path
 
@@ -119,7 +120,7 @@ def create_robot_control_sliders(
         initial_config.append(initial_pos)
     return slider_handles, initial_config
 
-def load_local_image(image_path: Path):
+def load_local_image(image_path: Path, resize=True):
     # ローカルJPG画像を読み込み
     # jpg_image_path = Path(__file__).parent / "raw_image.jpg"
     jpg_pil_image = Image.open(image_path)
@@ -127,12 +128,46 @@ def load_local_image(image_path: Path):
     if jpg_pil_image.mode != 'RGB':
         jpg_pil_image = jpg_pil_image.convert('RGB')
 
-    # 大きな画像はリサイズ（最大640x480）
-    max_width, max_height = 640, 480
-    if jpg_pil_image.width > max_width or jpg_pil_image.height > max_height:
-        jpg_pil_image.thumbnail((max_width, max_height), Image.Resampling.LANCZOS)
+    if resize:
+        # 大きな画像はリサイズ（最大640x480）
+        max_width, max_height = 640, 480
+        if jpg_pil_image.width > max_width or jpg_pil_image.height > max_height:
+            jpg_pil_image.thumbnail((max_width, max_height), Image.Resampling.LANCZOS)
 
     return jpg_pil_image
+
+def up_sam_process():
+    # Grounded-SAMのコマンドを構築
+    sam_command = [
+        "/home/ubuntu/src/Grounded-Segment-Anything/.venv/bin/python",
+        "/home/ubuntu/src/Grounded-Segment-Anything/grounded_sam_demo.py",
+        "--config",
+        "/home/ubuntu/src/Grounded-Segment-Anything/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py",
+        "--grounded_checkpoint",
+        "/home/ubuntu/src/Grounded-Segment-Anything/groundingdino_swint_ogc.pth",
+        "--sam_checkpoint",
+        "/home/ubuntu/src/Grounded-Segment-Anything/sam_vit_h_4b8939.pth",
+        "--input_image", "/tmp/snapshot.png",
+        "--output_dir", "/tmp/outputs",
+        "--box_threshold", "0.3",
+        "--text_threshold", "0.25",
+        "--text_prompt", "robot arm",
+        "--device", "cpu"
+    ]
+
+    try:
+        # SAM処理を実行
+        print("SAM処理を開始します...")
+        result = subprocess.run(
+            sam_command,
+            capture_output=True,
+            text=True,
+            timeout=600,  # 5分のタイムアウト
+            check=True
+        )
+    except Exception as e:
+        print(f"SAM処理に予期しないエラー: {e}")
+        print(f"stderr: {e.stderr}")
 
 def main():
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
@@ -199,9 +234,7 @@ def main():
             jpg_image_path = Path(__file__).parent / "raw_image.jpg"
             jpg_pil_image = load_local_image(jpg_image_path)
             jpg_image_handle.image = np.array(jpg_pil_image)
-            calib_btn.disabled = False
             snapshot_cache = np.array(jpg_pil_image)
-
 
             # 撮像完了の通知
             capture_notif.remove()
@@ -229,25 +262,43 @@ def main():
                     # SAM処理開始の通知
                     loading_notif = client.add_notification(
                         title="SAM処理中",
-                        body="Segment Anything Modelで画像を解析しています...",
+                        body=('Segmentation Anythingでロボット領域検出中。'
+                              'その間カメラposeを調整して赤いシルエット'
+                              'がおそよロボットの輪郭に重なるようにして。'),
                         loading=True,
                         with_close_button=False,
                     )
 
+                    # pil_image = Image.fromarray(snapshot_cache) # jiki
+                    # /tmp/snapshot.pngとして保存
+                    pil_image_hd = Image.open(jpg_image_path)
+                    # RGB形式に変換（必要に応じて）
+                    if pil_image_hd.mode != 'RGB':
+                        pil_image_hd = pil_image_hd.convert('RGB')
+                    snapshot_save_path = Path("/tmp/snapshot.png")
+                    pil_image_hd.save(snapshot_save_path)
+                    print(f"スナップショットを保存しました: {snapshot_save_path}")
+
                     # ここでSAM（Segment Anything Model）の処理を実行
                     # 実際の処理をシミュレートするため少し待機
-                    time.sleep(2)  # 実際のSAM処理に置き換える
+                    # time.sleep(2)  # 実際のSAM処理に置き換える
+                    up_sam_process()
+
+                    sam_image_path = "/tmp/outputs/mask_resize.png"
+                    sam_pil_image = load_local_image(sam_image_path)
+                    mask_image_handle.image = np.array(sam_pil_image)
 
                     # 処理完了の通知
                     loading_notif.remove()  # ローディング通知を削除
 
                     client.add_notification(
                         title="SAM処理完了",
-                        body="画像の解析が完了しました。ロボットマスク画像確認しろください",
+                        body="画像の解析が完了しました。SAMマスク画像確認しろください",
                         loading=False,
                         with_close_button=True,
                         auto_close_seconds=3,  # 3秒後に自動で閉じる
                     )
+                    calib_btn.disabled = False
 
                 client.gui.add_button("この画像でいく").on_click(lambda _: run_sam())
                 client.gui.add_button("再撮影する").on_click(lambda _: modal.close())
@@ -302,7 +353,7 @@ def main():
         # マスク画像表示用のハンドル
         mask_image_handle = server.gui.add_image(
             img_np,
-            label="計算マスク画像",
+            label="SAMマスク",
             format="png"
         )
 
@@ -340,7 +391,7 @@ def main():
             img = np.stack([mask_normalized, mask_normalized, mask_normalized], axis=2)
         else:
             img = mask_normalized
-        mask_image_handle.image = img
+        # mask_image_handle.image = img
         base_image = snapshot_cache
 
         # PILを使ったマスク画像のオーバーレイ
