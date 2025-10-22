@@ -251,7 +251,22 @@ def main():
                     cx=951.341552734375,
                     cy=532.13677978515625,
                 )
-                renderer.set_camera_info(camera_info)
+                # resize to max 640x480
+                target_width, target_height = 640, 480
+                scale_x = target_width / camera_info.width
+                scale_y = target_height / camera_info.height
+                scale = min(scale_x, scale_y)
+                resized_width = int(camera_info.width * scale)
+                resized_height = int(camera_info.height * scale)
+                camera_info_low = CameraInfo(
+                    width=resized_width,
+                    height=resized_height,
+                    fx=camera_info.fx * scale,
+                    fy=camera_info.fy * scale,
+                    cx=camera_info.cx * scale,
+                    cy=camera_info.cy * scale,
+                )
+                renderer.set_camera_info(camera_info_low)
 
             # 撮像開始の通知
             capture_notif = client.add_notification(
@@ -333,6 +348,7 @@ def main():
 
         @calib_btn.on_click
         def _(_) -> None:
+            obj_handle.visible = False
             # キャリブレーション開始の通知
             calib_notif = client.add_notification(
                 title="キャリブレーション実行中",
@@ -364,6 +380,7 @@ def main():
             T_b2c_result = np.linalg.inv(T_c2b_result)
 
             # update with result
+            obj_handle.visible = True
             pos_b2c = T_b2c_result[:3, 3]
             wxyz_b2c = trimesh.transformations.quaternion_from_matrix(T_b2c_result[:3, :3])
             obj_handle.position = pos_b2c
@@ -379,6 +396,7 @@ def main():
                       f'\npos_robot2cam={pos_b2c}\nwxyz_robot2cam={wxyz_b2c}',
                     )
             )
+
 
 
     # PIL画像の表示例
