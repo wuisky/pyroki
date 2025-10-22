@@ -12,32 +12,21 @@ import pytorch_kinematics
 import torch
 import trimesh
 import viser
+from easyhec.optim.nvdiffrast_cameara_calibrator import (
+    CameraInfo,
+    NvdiffrastCameraCalibrator,
+)
 from easyhec.optim.nvdiffrast_renderer import NVDiffrastRenderer
 from PIL import Image
-from robot_descriptions.loaders.yourdfpy import load_robot_description, yourdfpy
 from viser.extras import ViserUrdf
 
-import pyroki as pk
-from pyroki.collision import HalfSpace, RobotCollision, Sphere
+from robot_descriptions.loaders.yourdfpy import load_robot_description, yourdfpy
 
 
 class MaskRenderer:
     def __init__(self, urdf_path: Path):
-        # # todo:read camera info from config file
-        # width = 640
-        # height = 480
-        # self.intrinsic = torch.tensor([
-        #     [554.25469, 0, width/2],
-        #     [0, 554.25469, height/2],
-        #     [0, 0, 1]
-        # ], dtype=torch.float32).cuda()
-        width = 1920
-        height = 1080
-        self.intrinsic = torch.tensor([
-            [1125.966064453125, 0.0, 951.341552734375],
-            [ 0.0, 1125.034912109375, 532.13677978515625],
-            [0.0, 0.0, 1.0]
-        ], dtype=torch.float32).cpu().numpy()
+        self.intrinsic = None
+        self.renderer = None
 
         self.urdf = yourdfpy.URDF.load(str(urdf_path))
         self.visible_links = {
@@ -64,9 +53,20 @@ class MaskRenderer:
             self.map_link2verts[link_name] = vertices
             self.map_link2faces[link_name] = faces
 
-        self.renderer = NVDiffrastRenderer(height, width)
+
+    def set_camera_info(self, camera_info: CameraInfo):
+        self.intrinsic = np.array([
+            [camera_info.fx, 0, camera_info.cx],
+            [0, camera_info.fy, camera_info.cy],
+            [0, 0, 1],
+        ], dtype=np.float32)
+        self.renderer = NVDiffrastRenderer(camera_info.height,
+                                           camera_info.width)
+
 
     def render(self, q, T_c2b, anti_aliasing=False):
+        if self.renderer is None:
+            raise RuntimeError('Camera info is not set yet.')
         fk_ret = self.chain.forward_kinematics(q, end_only=False)
         self.renderer.clear_mesh()
         for link_name in self.visible_links:
@@ -111,6 +111,7 @@ def create_robot_control_sliders(
             max=upper,
             step=1e-3,
             initial_value=initial_pos,
+            disabled=True,
         )
         slider.on_update(  # When sliders move, we update the URDF configuration.
             lambda _: viser_urdf.update_cfg(
@@ -121,21 +122,33 @@ def create_robot_control_sliders(
         initial_config.append(initial_pos)
     return slider_handles, initial_config
 
-def load_local_image(image_path: Path, resize=True):
+def load_rgb_image(image_path: Path, resize=True):
     # ローカルJPG画像を読み込み
     # jpg_image_path = Path(__file__).parent / "raw_image.jpg"
-    jpg_pil_image = Image.open(image_path)
+    pil_image = Image.open(image_path)
     # RGB形式に変換（必要に応じて）
-    if jpg_pil_image.mode != 'RGB':
-        jpg_pil_image = jpg_pil_image.convert('RGB')
+    if pil_image.mode != 'RGB':
+        pil_image = pil_image.convert('RGB')
 
     if resize:
         # 大きな画像はリサイズ（最大640x480）
         max_width, max_height = 640, 480
-        if jpg_pil_image.width > max_width or jpg_pil_image.height > max_height:
-            jpg_pil_image.thumbnail((max_width, max_height), Image.Resampling.LANCZOS)
+        if pil_image.width > max_width or pil_image.height > max_height:
+            pil_image.thumbnail((max_width, max_height), Image.Resampling.LANCZOS)
 
-    return jpg_pil_image
+    return pil_image
+
+def load_gray_image(image_path):
+    """PIL Imageを使ってマスク画像を読み込み、バイナリ化する"""
+    # 画像を読み込んでグレースケールに変換
+    mask_pil = Image.open(image_path).convert('L')
+    # NumPy配列に変換して正規化
+    mask_img = np.array(mask_pil) / 255.0
+    # バイナリ化
+    mask_bin = mask_img > 0.5
+
+    return mask_bin
+
 
 def up_sam_process():
     # Grounded-SAMのコマンドを構築
@@ -172,7 +185,7 @@ def up_sam_process():
 
 def main():
     # # todo: pass from command line
-    urdf_path = Path(__file__).parent / '../mesh/ur5e/ur5e.urdf'
+    urdf_path = Path(__file__).parent / '../robot_descriptions/ur5e/ur5e.urdf'
     urdf = yourdfpy.URDF.load(str(urdf_path))
     # target_link_name = "tool0"
     renderer = MaskRenderer(urdf_path)
@@ -183,7 +196,7 @@ def main():
     urdf_vis = ViserUrdf(server, urdf, root_node_name="/robot")
 
     # create camera
-    mesh = trimesh.load_mesh(Path(__file__).parent / '../mesh/security_camera.stl')
+    mesh = trimesh.load_mesh(Path(__file__).parent / '../robot_descriptions/security_camera.stl')
     mesh.apply_scale(0.003)
     obj_handle = server.scene.add_transform_controls(
         "/camera",
@@ -210,6 +223,8 @@ def main():
 
     snapshot_cache = None
     snapshot_btn = None
+    camera_info = None
+    joint_angles = None
     @server.on_client_connect
     def _(client: viser.ClientHandle) -> None:
         nonlocal snapshot_btn
@@ -217,7 +232,6 @@ def main():
             label='撮像',  # ボタンに表示されるテキスト
             disabled = True,
         )
-        # 画像更新ボタン
         calib_btn = client.gui.add_button(
                     label='キャリブレーション開始',
                     disabled=True,
@@ -225,7 +239,20 @@ def main():
 
         @snapshot_btn.on_click
         def _(_) -> None:
-            nonlocal snapshot_cache
+            nonlocal snapshot_cache, camera_info
+            if camera_info is None:
+                # TODO: get camera_info from PF API
+                print('getting camera info from PF API...')
+                camera_info = CameraInfo(
+                    width=1920,
+                    height=1080,
+                    fx=1125.966064453125,
+                    fy=1125.034912109375,
+                    cx=951.341552734375,
+                    cy=532.13677978515625,
+                )
+                renderer.set_camera_info(camera_info)
+
             # 撮像開始の通知
             capture_notif = client.add_notification(
                 title="撮像中",
@@ -236,7 +263,7 @@ def main():
 
             # ローカルJPG画像を読み込み
             jpg_image_path = Path(__file__).parent / "raw_image.jpg"
-            jpg_pil_image = load_local_image(jpg_image_path)
+            jpg_pil_image = load_rgb_image(jpg_image_path)
             jpg_image_handle.image = np.array(jpg_pil_image)
             snapshot_cache = np.array(jpg_pil_image)
 
@@ -283,7 +310,7 @@ def main():
 
                     # up_sam_process()
                     sam_image_path = "/tmp/outputs/mask_resize.png"
-                    sam_pil_image = load_local_image(sam_image_path)
+                    sam_pil_image = load_rgb_image(sam_image_path)
                     mask_image_handle.image = np.array(sam_pil_image)
 
                     # 処理完了の通知
@@ -295,7 +322,6 @@ def main():
                               '赤いシルエットがカメラ画像に表示されるのでそれを'
                               '写真のロボットのシルエット'
                               'に大体合うようにしてからキャリブレーション開始を押してください.'
-                              '目安としてシルエットの向きを揃ってちょっと重なるぐらいで良いから'
                             ),
                         # auto_close_seconds=180,  # 3秒後に自動で閉じる
                     )
@@ -315,14 +341,43 @@ def main():
                 with_close_button=False,
             )
 
+            mask_path = "/tmp/outputs/mask_resize.png"
+            mask_bin = load_gray_image(mask_path)
+            robot_masks = np.stack([mask_bin])  # b, H, W
+
+            T_b2c = np.eye(4)
+            T_b2c[:3, 3] = obj_handle.position
+            rot = trimesh.transformations.quaternion_matrix(obj_handle.wxyz)
+            T_b2c[:3, :3] = rot[:3, :3]
+            T_c2b = np.linalg.inv(T_b2c)
+
+            calibrator = NvdiffrastCameraCalibrator(
+                camera_info=camera_info,
+                urdf_path=urdf_path,
+            )
+            print(f'{joint_angles=}')
+            T_c2b_result = calibrator.calibrate(
+                q=joint_angles,
+                robot_masks=robot_masks,
+                initial_extrinsic_guess=T_c2b,
+            )
+            T_b2c_result = np.linalg.inv(T_c2b_result)
+
+            # update with result
+            pos_b2c = T_b2c_result[:3, 3]
+            wxyz_b2c = trimesh.transformations.quaternion_from_matrix(T_b2c_result[:3, :3])
+            obj_handle.position = pos_b2c
+            obj_handle.wxyz = wxyz_b2c
             update_mask()
 
             # キャリブレーション完了の通知
             calib_notif.remove()
             client.add_notification(
-                title="キャリブレーション完了",
-                body="キャリブレーション計算が完了しました。",
-                auto_close_seconds=4,
+                title='キャリブレーション完了',
+                body=('キャリブレーション計算が完了しました。'
+                      '赤いシルエットがロボットにピッタリ！のであれば成功だ！おめでとう！'
+                      f'\npos_robot2cam={pos_b2c}\nwxyz_robot2cam={wxyz_b2c}',
+                    )
             )
 
 
@@ -411,13 +466,12 @@ def main():
     ######## callback
     @update_joint_btn.on_click
     def _(_) -> None:
-        nonlocal snapshot_btn
+        nonlocal snapshot_btn, joint_angles
+        # TODO: get actual joint angles from PF API
         th_deg = [-99.57, -149.865, -61.46, 0.0, 90.0, 0.0]
-        th_rad = [np.deg2rad(angle) for angle in th_deg]
-        urdf_vis.update_cfg(th_rad)
-        # for _, (slider, angle_rad) in enumerate(zip(slider_handles, th_rad)):
-        #    slider.value = angle_rad
-        for _, (slider, angle_rad) in enumerate(zip(slider_handles, th_rad)):
+        joint_angles = [np.deg2rad(angle) for angle in th_deg]
+        urdf_vis.update_cfg(joint_angles)
+        for _, (slider, angle_rad) in enumerate(zip(slider_handles, joint_angles)):
             slider.value = angle_rad
         snapshot_btn.disabled = False
 
