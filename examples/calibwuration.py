@@ -14,8 +14,7 @@ import trimesh
 import viser
 from easyhec.optim.nvdiffrast_renderer import NVDiffrastRenderer
 from PIL import Image
-from robot_descriptions.loaders.yourdfpy import (load_robot_description,
-                                                 yourdfpy)
+from robot_descriptions.loaders.yourdfpy import load_robot_description, yourdfpy
 from viser.extras import ViserUrdf
 
 import pyroki as pk
@@ -67,8 +66,9 @@ class MaskRenderer:
 
         self.renderer = NVDiffrastRenderer(height, width)
 
-    def render(self, q, T_c2b):
+    def render(self, q, T_c2b, anti_aliasing=False):
         fk_ret = self.chain.forward_kinematics(q, end_only=False)
+        self.renderer.clear_mesh()
         for link_name in self.visible_links:
             # print(f'{link=} {fk_ret[link]=}')
             link = self.urdf.link_map[link_name]
@@ -80,11 +80,12 @@ class MaskRenderer:
             T_b2l = (fk_ret[link_name].get_matrix().squeeze(0) @
                      torch.from_numpy(T_visual_link).float())
             T_c2l = T_c2b @ T_b2l
+
             self.renderer.append_mesh(self.map_link2verts[link_name],
                                       self.map_link2faces[link_name],
                                       T_c2l.cuda(),
                                       self.intrinsic)
-        mask = self.renderer.render_mask_batched(anti_aliasing=True)
+        mask = self.renderer.render_mask_batched(anti_aliasing)
         self.renderer.clear_mesh()
 
         return mask.detach().cpu().numpy()
@@ -170,9 +171,8 @@ def up_sam_process():
         print(f"stderr: {e.stderr}")
 
 def main():
-    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     # # todo: pass from command line
-    urdf_path = Path(__file__).parent / '../wur5e/ur5e.urdf'
+    urdf_path = Path(__file__).parent / '../mesh/ur5e/ur5e.urdf'
     urdf = yourdfpy.URDF.load(str(urdf_path))
     # target_link_name = "tool0"
     renderer = MaskRenderer(urdf_path)
@@ -184,12 +184,13 @@ def main():
 
     # create camera
     mesh = trimesh.load_mesh(Path(__file__).parent / '../mesh/security_camera.stl')
-    mesh.apply_scale(0.001)
+    mesh.apply_scale(0.003)
     obj_handle = server.scene.add_transform_controls(
         "/camera",
         scale=0.2,
         wxyz=(0, 0, 1, 0),
-        position=(0.4, 0.0, 0.7)
+        position=(0.4, 0.0, 0.7),
+        visible=False,
     )
     # viserで可視化
     server.scene.add_mesh_trimesh("/camera/visual", mesh=mesh, wxyz=(0, 0.707, 0, 0.707))
@@ -255,20 +256,17 @@ def main():
                     format="jpeg"
                 )
 
-                client.gui.add_markdown('再撮像しない場合、カメラの位置を調整して'
-                                        '赤いシルエットを写真のロボットのシルエット'
-                                        'に大体合うようにしてから'
-                                        'キャリブレーション開始を押してください。'
-                                        '本当に大体でいいから')
+                client.gui.add_markdown('再撮像もできるよ')
 
                 def run_sam():
                     modal.close()
                     # SAM処理開始の通知
                     loading_notif = client.add_notification(
                         title="SAM処理中",
-                        body=('Segmentation Anythingでロボット領域検出中。'
-                              'その間カメラposeを調整して赤いシルエット'
-                              'がおそよロボットの輪郭に重なるようにして。'),
+                        body=('Segmentation Anythingでロボット領域検出中'
+                              #'その間カメラposeを調整して赤いシルエット'
+                              #'がおそよロボットの輪郭に重なるようにして。'
+                              ),
                         loading=True,
                         with_close_button=False,
                     )
@@ -283,29 +281,29 @@ def main():
                     pil_image_hd.save(snapshot_save_path)
                     print(f"スナップショットを保存しました: {snapshot_save_path}")
 
-                    # ここでSAM（Segment Anything Model）の処理を実行
-                    # 実際の処理をシミュレートするため少し待機
-                    # time.sleep(2)  # 実際のSAM処理に置き換える
-                    up_sam_process()
-
+                    # up_sam_process()
                     sam_image_path = "/tmp/outputs/mask_resize.png"
                     sam_pil_image = load_local_image(sam_image_path)
                     mask_image_handle.image = np.array(sam_pil_image)
 
                     # 処理完了の通知
                     loading_notif.remove()  # ローディング通知を削除
-
                     client.add_notification(
                         title="SAM処理完了",
-                        body="画像の解析が完了しました。SAMマスク画像確認しろください",
-                        loading=False,
-                        with_close_button=True,
-                        auto_close_seconds=3,  # 3秒後に自動で閉じる
+                        body=('画像の解析が完了しました。SAMマスク画像確認しろください.'
+                              '続いてカメラの位置を調整し,'
+                              '赤いシルエットがカメラ画像に表示されるのでそれを'
+                              '写真のロボットのシルエット'
+                              'に大体合うようにしてからキャリブレーション開始を押してください.'
+                              '目安としてシルエットの向きを揃ってちょっと重なるぐらいで良いから'
+                            ),
+                        # auto_close_seconds=180,  # 3秒後に自動で閉じる
                     )
                     calib_btn.disabled = False
+                    obj_handle.visible = True
 
                 client.gui.add_button("この画像でいく").on_click(lambda _: run_sam())
-                client.gui.add_button("再撮影する").on_click(lambda _: modal.close())
+                client.gui.add_button("再撮像する").on_click(lambda _: modal.close())
 
         @calib_btn.on_click
         def _(_) -> None:
@@ -356,15 +354,17 @@ def main():
         T_c2b = np.linalg.inv(T_b2c)
         T_c2b = torch.from_numpy(T_c2b).float()
         q = [q.value for q in slider_handles]
-        try:
-            mask_np = renderer.render(q, T_c2b)
-        except Exception as e:
-            print(f"レンダリングエラー: {e}")
-            return
+        # try:
+        #     mask_np = renderer.render(q, T_c2b)
+        # except Exception as e:
+        #     print(f"レンダリングエラー: {e}")
+        #     return
+        mask_np = renderer.render(q, T_c2b)
 
-        # マスク画像を適切な形式に変換
-        if mask_np.ndim == 3 and mask_np.shape[0] == 1:
-            mask_np = mask_np[0]  # バッチ次元を削除
+        # print(f'{mask_np.shape=}')
+        # # マスク画像を適切な形式に変換
+        # if mask_np.ndim == 3 and mask_np.shape[0] == 1:
+        #     mask_np = mask_np[0]  # バッチ次元を削除
 
         # マスクサイズを制限（640x480）
         max_width, max_height = 640, 480
@@ -382,8 +382,9 @@ def main():
             img = np.stack([mask_normalized, mask_normalized, mask_normalized], axis=2)
         else:
             img = mask_normalized
+
         # mask_image_handle.image = img
-        base_image = snapshot_cache
+        base_image = snapshot_cache.copy()
 
         # PILを使ったマスク画像のオーバーレイ
         if base_image is not None and base_image.shape[:2] == img.shape[:2]:
@@ -395,7 +396,7 @@ def main():
             overlay = Image.new("RGBA", base_pil.size, (255, 0, 0, 0))
 
             # マスクを半透明に変換（0-255の範囲で128=50%透明度）
-            overlay_mask = mask_pil.point(lambda x: 128 if x > 128 else 0)
+            overlay_mask = mask_pil.point(lambda x: 128 if x > 0 else 0)
             overlay.putalpha(overlay_mask)
 
             # アルファ合成でオーバーレイ
