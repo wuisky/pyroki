@@ -93,9 +93,13 @@ class ImageProcessor:
             pil_image = pil_image.convert('RGB')
 
         if resize:
-            max_width, max_height = 640, 480
-            if pil_image.width > max_width or pil_image.height > max_height:
-                pil_image.thumbnail((max_width, max_height), Image.Resampling.LANCZOS)
+            pil_image = ImageProcessor.resize_image(pil_image, 640, 480)
+        return pil_image
+
+    @staticmethod
+    def resize_image(pil_image: Image.Image, max_width: int, max_height: int) -> Image.Image:
+        if pil_image.width > max_width or pil_image.height > max_height:
+            pil_image.thumbnail((max_width, max_height), Image.Resampling.LANCZOS)
         return pil_image
 
     @staticmethod
@@ -130,7 +134,7 @@ class SAMProcessor:
         base_path = '/home/ubuntu/src/Grounded-Segment-Anything'
         sam_command = [
             f'{base_path}/.venv/bin/python',
-            f'{base_path}/grounded_sam_demo.py',
+            f'{base_path}/fix_seed_grounded_sam_demo.py',
             '--config',
             f'{base_path}/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py',
             '--grounded_checkpoint',
@@ -157,6 +161,8 @@ class SAMProcessor:
             return True
         except Exception as e:
             print(f'SAM処理に予期しないエラー: {e}')
+            print(f'stderr: {e.stderr}')
+
             return False
 
 
@@ -168,6 +174,7 @@ class CalibrationApp:
 
         # State variables
         self.snapshot_cache: Optional[np.ndarray] = None
+        self.snapshot_cache_low: Optional[np.ndarray] = None
         self.camera_info: Optional[CameraInfo] = None
         self.joint_angles: Optional[List[float]] = None
 
@@ -276,11 +283,7 @@ class CalibrationApp:
         for slider, angle_rad in zip(self.slider_handles, self.joint_angles):
             slider.value = angle_rad
 
-        # 撮像ボタンを有効化
-        for client_id in self.server.get_clients():
-            client = self.server.get_clients()[client_id]
-            if hasattr(client, 'snapshot_btn'):
-                client.snapshot_btn.disabled = False
+        self._toggle_snapshot_btn()
 
     def _on_snapshot(self, client: viser.ClientHandle, calib_btn):
         """撮像処理"""
@@ -294,33 +297,40 @@ class CalibrationApp:
         )
 
         # 画像読み込み TODO:PF API
-        jpg_image_path = Path(__file__).parent / 'raw_image.jpg'
-        jpg_pil_image = ImageProcessor.load_rgb_image(jpg_image_path)
-        self.jpg_image_handle.image = np.array(jpg_pil_image)
-        self.snapshot_cache = np.array(jpg_pil_image)
+        image_path = Path(__file__).parent / 'raw_image.jpg'
+        pil_image = ImageProcessor.load_rgb_image(image_path, resize=False)
+        self.snapshot_cache = np.array(pil_image)
+        self.snapshot_cache_low = np.array(ImageProcessor.resize_image(pil_image, 640, 480))
+        self.jpg_image_handle.image = self.snapshot_cache_low
 
         capture_notif.remove()
         client.add_notification(title='撮像完了', body='画像が正常に取得されました', auto_close_seconds=5)
 
         # モーダル表示
-        self._show_confirmation_modal(client, jpg_pil_image, jpg_image_path, calib_btn)
+        self._show_confirmation_modal(client, calib_btn)
 
-    def _show_confirmation_modal(self, client: viser.ClientHandle, jpg_pil_image: Image.Image,
-                                jpg_image_path: Path, calib_btn):
+    def _show_confirmation_modal(self, client: viser.ClientHandle,
+                                 calib_btn):
         """確認モーダルを表示"""
         with client.gui.add_modal('この画像でいいの？') as modal:
-            modal_img_np = np.array(jpg_pil_image)
-            client.gui.add_image(modal_img_np, format='jpeg')
+            client.gui.add_image(self.snapshot_cache_low, format='jpeg')
             client.gui.add_markdown('再撮像もできるよ')
 
             def run_sam():
                 modal.close()
-                self._run_sam_processing(client, jpg_image_path, calib_btn)
+                self._run_sam_processing(client, calib_btn)
 
             client.gui.add_button('この画像でいく').on_click(lambda _: run_sam())
             client.gui.add_button('再撮像する').on_click(lambda _: modal.close())
 
-    def _run_sam_processing(self, client: viser.ClientHandle, jpg_image_path: Path, calib_btn):
+    def _toggle_snapshot_btn(self):
+        for client_id in self.server.get_clients():
+            client = self.server.get_clients()[client_id]
+            if hasattr(client, 'snapshot_btn'):
+                client.snapshot_btn.disabled = not client.snapshot_btn.disabled
+
+
+    def _run_sam_processing(self, client: viser.ClientHandle, calib_btn):
         """SAM処理を実行"""
         loading_notif = client.add_notification(
             title='SAM処理中', body='Segmentation Anythingでロボット領域検出中',
@@ -338,21 +348,27 @@ class CalibrationApp:
         snapshot_pil.save(snapshot_save_path)
         print(f'スナップショットキャッシュを保存しました: {snapshot_save_path}')
         print(f'保存画像サイズ: {snapshot_pil.size}')
+        self._toggle_snapshot_btn()
 
-
-        # SAM処理は省略（up_sam_process()）
+        # SAM処理
+        SAMProcessor.run_sam_process()
         sam_image_path = '/tmp/outputs/mask_resize.png'
-        if Path(sam_image_path).exists():
-            sam_pil_image = ImageProcessor.load_rgb_image(sam_image_path)
-            self.mask_image_handle.image = np.array(sam_pil_image)
+        sam_pil_image = ImageProcessor.load_rgb_image(sam_image_path)
+        self.mask_image_handle.image = np.array(sam_pil_image)
 
         loading_notif.remove()
         client.add_notification(
             title='SAM処理完了',
-            body='画像の解析が完了しました。カメラの位置を調整してキャリブレーション開始を押してください。'
+            body=('画像の解析が完了しました。SAMマスク画像確認しろください.'
+                '続いてカメラの位置を調整し,'
+                '赤いシルエットがカメラ画像に表示されるのでそれを'
+                '写真のロボットのシルエット'
+                'に大体合うようにしてからキャリブレーション開始を押してください.'
+            ),
         )
         calib_btn.disabled = False
         self.obj_handle.visible = True
+        self._toggle_snapshot_btn()
 
     def _on_calibration(self, client: viser.ClientHandle):
         """キャリブレーション処理"""
@@ -391,7 +407,7 @@ class CalibrationApp:
             calib_notif.remove()
             client.add_notification(
                 title='キャリブレーション完了',
-                body='キャリブレーション計算が完了しました。赤いシルエットがロボットにピッタリ！'
+                body='キャリブレーション計算が完了しました。赤いシルエットがロボットにピッタリ！であれば成功'
             )
 
         except Exception as e:
@@ -400,6 +416,7 @@ class CalibrationApp:
                 title='キャリブレーションエラー',
                 body=f'エラーが発生しました: {str(e)}'
             )
+            print(f'stderr: {e.stderr}')
 
     def _on_camera_update(self, _):
         '''カメラ更新時の処理'''
@@ -472,8 +489,8 @@ class CalibrationApp:
                 img = mask_normalized
 
             # オーバーレイ処理
-            if self.snapshot_cache is not None:
-                overlaid_image = ImageProcessor.create_overlay(self.snapshot_cache.copy(), img)
+            if self.snapshot_cache_low is not None:
+                overlaid_image = ImageProcessor.create_overlay(self.snapshot_cache_low.copy(), img)
                 self.jpg_image_handle.image = overlaid_image
 
         except Exception as e:
