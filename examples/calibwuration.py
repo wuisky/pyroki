@@ -274,7 +274,7 @@ class CalibrationApp:
         client.snapshot_btn = snapshot_btn
         client.calib_btn = calib_btn
 
-        snapshot_btn.on_click(lambda _: self._on_snapshot(client, calib_btn))
+        snapshot_btn.on_click(lambda _: self._on_snapshot(client))
         calib_btn.on_click(lambda _: self._on_calibration(client))
 
     def _on_update_joint_angles(self, _):
@@ -287,9 +287,9 @@ class CalibrationApp:
         for slider, angle_rad in zip(self.slider_handles, self.joint_angles):
             slider.value = angle_rad
 
-        self._toggle_btn('snapshot_btn')
+        self._toggle_btn('snapshot_btn', True)
 
-    def _on_snapshot(self, client: viser.ClientHandle, calib_btn):
+    def _on_snapshot(self, client: viser.ClientHandle):
         """撮像処理"""
         if self.camera_info is None:
             self._setup_camera_info()
@@ -312,10 +312,9 @@ class CalibrationApp:
         client.add_notification(title='撮像完了', body='画像が正常に取得されました', auto_close_seconds=5)
 
         # モーダル表示
-        self._show_confirmation_modal(client, calib_btn)
+        self._show_confirmation_modal(client)
 
-    def _show_confirmation_modal(self, client: viser.ClientHandle,
-                                 calib_btn):
+    def _show_confirmation_modal(self, client: viser.ClientHandle):
         """確認モーダルを表示"""
         with client.gui.add_modal('この画像でいいの？') as modal:
             client.gui.add_image(self.snapshot_cache_low, format='jpeg')
@@ -323,18 +322,20 @@ class CalibrationApp:
 
             def run_sam():
                 modal.close()
-                self._run_sam_processing(client, calib_btn)
+                self._run_sam_processing(client)
 
             client.gui.add_button('この画像でいく').on_click(lambda _: run_sam())
             client.gui.add_button('再撮像する').on_click(lambda _: modal.close())
 
-    def _toggle_btn(self, btn_name):
+    def _toggle_btn(self, btn_name, force_state: Optional[bool] = None):
         for client_id in self.server.get_clients():
             client = self.server.get_clients()[client_id]
             if hasattr(client, btn_name):
                 getattr(client, btn_name).disabled = not getattr(client, btn_name).disabled
+                if force_state is not None:
+                    getattr(client, btn_name).disabled = not force_state
 
-    def _run_sam_processing(self, client: viser.ClientHandle, calib_btn):
+    def _run_sam_processing(self, client: viser.ClientHandle):
         """SAM処理を実行"""
         loading_notif = client.add_notification(
             title='SAM処理中', body='Segmentation Anythingでロボット領域検出中...時間かかる',
@@ -370,7 +371,7 @@ class CalibrationApp:
                   'に大体合うようにしてからキャリブレーション開始を押してください.'
                   ),
         )
-        calib_btn.disabled = False
+        self._toggle_btn('calib_btn', True)
         self.obj_handle.visible = True
         self._toggle_btn('snapshot_btn')
 
@@ -452,12 +453,12 @@ class CalibrationApp:
         resized_width = int(self.camera_info.width * scale)
         resized_height = int(self.camera_info.height * scale)
 
-        self.camera_info_low = CameraInfo(
+        camera_info_low = CameraInfo(
             width=resized_width, height=resized_height,
             fx=self.camera_info.fx * scale, fy=self.camera_info.fy * scale,
             cx=self.camera_info.cx * scale, cy=self.camera_info.cy * scale,
         )
-        self.renderer.set_camera_info(self.camera_info_low)
+        self.renderer.set_camera_info(camera_info_low)
 
     def _get_camera_transform(self) -> np.ndarray:
         """現在のカメラ変換行列を取得"""
