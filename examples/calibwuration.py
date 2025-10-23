@@ -333,7 +333,7 @@ class CalibrationApp:
     def _run_sam_processing(self, client: viser.ClientHandle, calib_btn):
         """SAM処理を実行"""
         loading_notif = client.add_notification(
-            title='SAM処理中', body='Segmentation Anythingでロボット領域検出中',
+            title='SAM処理中', body='Segmentation Anythingでロボット領域検出中...時間かかる',
             loading=True, with_close_button=False
         )
 
@@ -399,6 +399,8 @@ class CalibrationApp:
                 initial_extrinsic_guess=T_c2b,
             )
             T_b2c_result = np.linalg.inv(T_c2b_result)
+            pos_b2c = T_b2c_result[:3, 3]
+            wxyz_b2c = trimesh.transformations.quaternion_from_matrix(T_b2c_result[:3, :3])
 
             # 結果をオブジェクトに反映
             self._update_camera_from_transform(T_b2c_result)
@@ -407,7 +409,10 @@ class CalibrationApp:
             calib_notif.remove()
             client.add_notification(
                 title='キャリブレーション完了',
-                body='キャリブレーション計算が完了しました。赤いシルエットがロボットにピッタリ！であれば成功'
+                body=('キャリブレーション計算が完了しました。'
+                      '赤いシルエットがロボットにピッタリ！のであれば成功だ！おめでとう！'
+                      f'\npos_robot2cam={pos_b2c}\nwxyz_robot2cam={wxyz_b2c}',
+                    )
             )
 
         except Exception as e:
