@@ -23,6 +23,9 @@ from viser.extras import ViserUrdf
 
 from robot_descriptions.loaders.yourdfpy import yourdfpy
 
+DISPLAY_WIDTH = 320
+DISPLAY_HEIGHT = 240
+
 
 class MaskRenderer:
     def __init__(self, urdf_path: Path):
@@ -93,7 +96,7 @@ class ImageProcessor:
             pil_image = pil_image.convert('RGB')
 
         if resize:
-            pil_image = ImageProcessor.resize_image(pil_image, 640, 480)
+            pil_image = ImageProcessor.resize_image(pil_image, DISPLAY_WIDTH, DISPLAY_HEIGHT)
         return pil_image
 
     @staticmethod
@@ -276,6 +279,7 @@ class CalibrationApp:
 
     def _on_update_joint_angles(self, _):
         """関節角度更新処理"""
+        # todo get from PF API
         th_deg = [-99.57, -149.865, -61.46, 0.0, 90.0, 0.0]
         self.joint_angles = [np.deg2rad(angle) for angle in th_deg]
         self.urdf_vis.update_cfg(self.joint_angles)
@@ -283,7 +287,7 @@ class CalibrationApp:
         for slider, angle_rad in zip(self.slider_handles, self.joint_angles):
             slider.value = angle_rad
 
-        self._toggle_snapshot_btn()
+        self._toggle_btn('snapshot_btn')
 
     def _on_snapshot(self, client: viser.ClientHandle, calib_btn):
         """撮像処理"""
@@ -300,7 +304,8 @@ class CalibrationApp:
         image_path = Path(__file__).parent / 'raw_image.jpg'
         pil_image = ImageProcessor.load_rgb_image(image_path, resize=False)
         self.snapshot_cache = np.array(pil_image)
-        self.snapshot_cache_low = np.array(ImageProcessor.resize_image(pil_image, 640, 480))
+        self.snapshot_cache_low = np.array(ImageProcessor.resize_image(
+            pil_image, DISPLAY_WIDTH, DISPLAY_HEIGHT))
         self.jpg_image_handle.image = self.snapshot_cache_low
 
         capture_notif.remove()
@@ -323,12 +328,11 @@ class CalibrationApp:
             client.gui.add_button('この画像でいく').on_click(lambda _: run_sam())
             client.gui.add_button('再撮像する').on_click(lambda _: modal.close())
 
-    def _toggle_snapshot_btn(self):
+    def _toggle_btn(self, btn_name):
         for client_id in self.server.get_clients():
             client = self.server.get_clients()[client_id]
-            if hasattr(client, 'snapshot_btn'):
-                client.snapshot_btn.disabled = not client.snapshot_btn.disabled
-
+            if hasattr(client, btn_name):
+                getattr(client, btn_name).disabled = not getattr(client, btn_name).disabled
 
     def _run_sam_processing(self, client: viser.ClientHandle, calib_btn):
         """SAM処理を実行"""
@@ -348,7 +352,7 @@ class CalibrationApp:
         snapshot_pil.save(snapshot_save_path)
         print(f'スナップショットキャッシュを保存しました: {snapshot_save_path}')
         print(f'保存画像サイズ: {snapshot_pil.size}')
-        self._toggle_snapshot_btn()
+        self._toggle_btn('snapshot_btn')
 
         # SAM処理
         SAMProcessor.run_sam_process()
@@ -360,19 +364,21 @@ class CalibrationApp:
         client.add_notification(
             title='SAM処理完了',
             body=('画像の解析が完了しました。SAMマスク画像確認しろください.'
-                '続いてカメラの位置を調整し,'
-                '赤いシルエットがカメラ画像に表示されるのでそれを'
-                '写真のロボットのシルエット'
-                'に大体合うようにしてからキャリブレーション開始を押してください.'
-            ),
+                  '続いてカメラの位置を調整し,'
+                  '赤いシルエットがカメラ画像に表示されるのでそれを'
+                  '写真のロボットのシルエット'
+                  'に大体合うようにしてからキャリブレーション開始を押してください.'
+                  ),
         )
         calib_btn.disabled = False
         self.obj_handle.visible = True
-        self._toggle_snapshot_btn()
+        self._toggle_btn('snapshot_btn')
 
     def _on_calibration(self, client: viser.ClientHandle):
         """キャリブレーション処理"""
         self.obj_handle.visible = False
+        self._toggle_btn('snapshot_btn')
+        self._toggle_btn('calib_btn')
         calib_notif = client.add_notification(
             title='キャリブレーション実行中', body='キャリブレーション計算しています...',
             loading=True, with_close_button=False
@@ -405,6 +411,8 @@ class CalibrationApp:
             # 結果をオブジェクトに反映
             self._update_camera_from_transform(T_b2c_result)
             self._update_mask()
+            self._toggle_btn('snapshot_btn')
+            self._toggle_btn('calib_btn')
 
             calib_notif.remove()
             client.add_notification(
@@ -412,7 +420,7 @@ class CalibrationApp:
                 body=('キャリブレーション計算が完了しました。'
                       '赤いシルエットがロボットにピッタリ！のであれば成功だ！おめでとう！'
                       f'\npos_robot2cam={pos_b2c}\nwxyz_robot2cam={wxyz_b2c}',
-                    )
+                      )
             )
 
         except Exception as e:
@@ -437,7 +445,7 @@ class CalibrationApp:
         )
 
         # 640x480にリサイズ
-        target_width, target_height = 640, 480
+        target_width, target_height = DISPLAY_WIDTH, DISPLAY_HEIGHT
         scale_x = target_width / self.camera_info.width
         scale_y = target_height / self.camera_info.height
         scale = min(scale_x, scale_y)
@@ -478,7 +486,7 @@ class CalibrationApp:
             mask_np = self.renderer.render(q, T_c2b)
 
             # マスクサイズを制限（640x480）
-            max_width, max_height = 640, 480
+            max_width, max_height = DISPLAY_WIDTH, DISPLAY_HEIGHT
             if mask_np.shape[0] > max_height or mask_np.shape[1] > max_width:
                 mask_pil = Image.fromarray((mask_np * 255).astype(np.uint8))
                 mask_pil.thumbnail((max_width, max_height), Image.Resampling.LANCZOS)
