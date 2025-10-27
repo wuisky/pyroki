@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
-import pytorch_kinematics
+from roboticstoolbox import Robot as rtb
 import torch
 import trimesh
 import viser
@@ -25,6 +25,7 @@ from robot_descriptions.loaders.yourdfpy import yourdfpy
 
 DISPLAY_WIDTH = 320
 DISPLAY_HEIGHT = 240
+SKIP_GROUNDED_SAM = True
 
 
 class MaskRenderer:
@@ -41,9 +42,7 @@ class MaskRenderer:
         }
         print(f'{self.visible_links=}')
         print(f'{list(self.visible_links.keys())[-1]=}')
-        self.chain = pytorch_kinematics.build_serial_chain_from_urdf(
-            open(urdf_path, mode='rb').read(),
-            list(self.visible_links.keys())[-1])
+        self.robot = rtb.URDF(urdf_path)
 
         self.map_link2verts = {}
         self.map_link2faces = {}
@@ -66,7 +65,11 @@ class MaskRenderer:
     def render(self, q, T_c2b, anti_aliasing=False):
         if self.renderer is None:
             raise RuntimeError('Camera info is not set yet.')
-        fk_ret = self.chain.forward_kinematics(q, end_only=False)
+        all_fk = self.robot.fkine_all(q)
+        visible_link_fk = {}
+        for (link, T) in zip(self.robot.links, all_fk):
+            if link.parent_name in self.visible_links:
+                visible_link_fk[link.parent_name] = T.A
         self.renderer.clear_mesh()
         for link_name in self.visible_links:
             link = self.urdf.link_map[link_name]
@@ -75,8 +78,7 @@ class MaskRenderer:
             else:
                 T_visual_link = np.eye(4)
 
-            T_b2l = (fk_ret[link_name].get_matrix().squeeze(0) @
-                     torch.from_numpy(T_visual_link).float())
+            T_b2l = torch.from_numpy(visible_link_fk[link_name] @ T_visual_link).float()
             T_c2l = T_c2b @ T_b2l
 
             self.renderer.append_mesh(self.map_link2verts[link_name],
@@ -142,14 +144,17 @@ class SAMProcessor:
             f'{base_path}/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py',
             '--grounded_checkpoint',
             f'{base_path}/groundingdino_swint_ogc.pth',
-            '--sam_checkpoint',
-            f'{base_path}/sam_vit_h_4b8939.pth',
+            '--sam_checkpoint', f'{base_path}/sam_vit_h_4b8939.pth',
+            '--sam_version', 'vit_h',
+            '--device', 'cpu',
+            # '--sam_checkpoint', f'{base_path}/sam_vit_b_01ec64.pth',
+            # '--sam_version', 'vit_b',
+            # '--device', 'cuda',
             '--input_image', '/tmp/snapshot.png',
             '--output_dir', '/tmp/outputs',
             '--box_threshold', '0.3',
             '--text_threshold', '0.25',
             '--text_prompt', 'robot arm',
-            '--device', 'cpu'
         ]
 
         try:
@@ -337,6 +342,7 @@ class CalibrationApp:
 
     def _run_sam_processing(self, client: viser.ClientHandle):
         """SAM処理を実行"""
+        self._toggle_btn('snapshot_btn', False)
         loading_notif = client.add_notification(
             title='SAM処理中', body='Segmentation Anythingでロボット領域検出中...時間かかる',
             loading=True, with_close_button=False
@@ -353,10 +359,11 @@ class CalibrationApp:
         snapshot_pil.save(snapshot_save_path)
         print(f'スナップショットキャッシュを保存しました: {snapshot_save_path}')
         print(f'保存画像サイズ: {snapshot_pil.size}')
-        self._toggle_btn('snapshot_btn')
 
         # SAM処理
-        SAMProcessor.run_sam_process()
+        if not SKIP_GROUNDED_SAM:
+            SAMProcessor.run_sam_process()
+        time.sleep(5)
         sam_image_path = '/tmp/outputs/mask_resize.png'
         sam_pil_image = ImageProcessor.load_rgb_image(sam_image_path)
         self.mask_image_handle.image = np.array(sam_pil_image)
@@ -418,8 +425,7 @@ class CalibrationApp:
             calib_notif.remove()
             client.add_notification(
                 title='キャリブレーション完了',
-                body=('キャリブレーション計算が完了しました。'
-                      '赤いシルエットがロボットにピッタリ！のであれば成功だ！おめでとう！'
+                body=('赤いシルエットがロボットにピッタリ！のであれば成功だ！おめでとう！'
                       f'\npos_robot2cam={pos_b2c}\nwxyz_robot2cam={wxyz_b2c}',
                       )
             )
@@ -430,7 +436,7 @@ class CalibrationApp:
                 title='キャリブレーションエラー',
                 body=f'エラーが発生しました: {str(e)}'
             )
-            print(f'stderr: {e.stderr}')
+            # print(f'stderr: {e.stderr}')
 
     def _on_camera_update(self, _):
         '''カメラ更新時の処理'''
