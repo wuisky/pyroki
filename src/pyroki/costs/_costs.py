@@ -194,17 +194,9 @@ def world_collision_cost(
 ) -> Array:
     """Computes the residual penalizing world collisions below a margin."""
     cfg = vals[joint_var]
-    # jax.debug.print("cfg: {x}", x=cfg)
     dist_matrix = robot_coll.compute_world_collision_distance(robot, cfg, world_geom)
     residual = colldist_from_sdf(dist_matrix, margin)
-    res = (residual * weight).flatten()
-    # jax.debug.print("dist_matrix: {x}", x=dist_matrix)
-    # jax.debug.print("dist_cost: {x}", x=residual)
-    # jax.debug.print("res: {x}", x=res)
-    return res
-    # return (residual * weight).flatten()
-
-
+    return (residual * weight).flatten()
 # --- Finite Difference Costs (Velocity, Acceleration, Jerk) ---
 
 

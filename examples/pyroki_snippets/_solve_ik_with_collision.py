@@ -82,10 +82,7 @@ def _solve_ik_with_collision_jax(
     joint_var = robot.joint_var_cls(0)  # 0 is for id
     vars = [joint_var]
 
-    jax.debug.print("ini_q: {x}", x=initial_joint_angles)
-    init_vals = jaxls.VarValues.make([vars[0].with_value(initial_joint_angles)])
-
-    # Weights and margins defined directly in factors
+    init_vals = jaxls.VarValues.make([vars[0].with_value(initial_joint_angles)])    # Weights and margins defined directly in factors
     costs = [
         pk.costs.pose_cost(
             robot,

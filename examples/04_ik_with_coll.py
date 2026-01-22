@@ -3,9 +3,17 @@
 Basic Inverse Kinematics with Collision Avoidance using PyRoKi.
 """
 
+import os
+# GPU memory optimization - disable preallocation
+os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
+os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'platform'
+# Force JAX to use CPU to avoid cuSolver errors with sphere collision (comment out to use GPU)
+# os.environ['JAX_PLATFORMS'] = 'cpu'
+
 import time
 from pathlib import Path
 
+import jax
 import jax.numpy as jnp
 import jaxlie
 import numpy as np
@@ -31,15 +39,14 @@ def main():
     #     str(Path(__file__).parent / '../ur5-bullet/UR5/ur_e_description/urdf/ur5e.urdf'))
     # target_link_name = "ee_link"
     urdf = yourdfpy.URDF.load(
-        str(Path(__file__).parent / '../wur5e/ur5e.urdf'))
+        str(Path(__file__).parent / '../wur5e/ur5e.urdf.sphere'))
     target_link_name = "tool0"
 
     robot = pk.Robot.from_urdf(urdf)
     new_default = jnp.array([0., -1.57, 0., -1.57, 0., 0.], dtype=jnp.float32)
     robot.joint_var_cls.default_factory = staticmethod(lambda: new_default)
 
-    robot_coll = RobotCollision.from_urdf(urdf)
-    print(f'{robot_coll=}')
+    robot_coll = RobotCollision.from_urdf_spheres(urdf)
     plane_coll = HalfSpace.from_point_and_normal(
         np.array([0.0, 0.0, 0.0]), np.array([0.0, 0.0, 1.0])
     )
@@ -151,7 +158,7 @@ def main():
         )
         # print(f'{solution=}')
         # print(f'{ik_target_handle.position=}, {ik_target_handle.wxyz=}')
-        print(f'{sphere_handle.position=}, {sphere_handle.wxyz=}')
+        # print(f'{sphere_handle.position=}, {sphere_handle.wxyz=}')
 
         # Update timing handle.
         timing_handle.value = (time.time() - start_time) * 1000
