@@ -5,8 +5,8 @@ Basic Inverse Kinematics with Collision Avoidance using PyRoKi.
 
 import os
 # GPU memory optimization - disable preallocation
-os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
-os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'platform'
+#os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
+#os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'platform'
 # Force JAX to use CPU to avoid cuSolver errors with sphere collision (comment out to use GPU)
 # os.environ['JAX_PLATFORMS'] = 'cpu'
 
