@@ -102,6 +102,64 @@ def rest_cost(
 
 
 @Cost.create_factory
+def base_joint_cost(
+    vals: VarValues,
+    joint_var: Var[Array],
+    current_pose: Array,
+    weight: Array | float,
+    threshold: float = 0.5,
+) -> Array:
+    """Encourages deviation from current first and last joint angles.
+
+    Penalizes when joints stay close to current_pose,
+    rewards when both deviate beyond threshold.
+
+    Args:
+        threshold: Minimum desired deviation (radians).
+                   Default 0.5 rad (~28 degrees).
+    """
+    # First joint deviation with angle normalization
+    diff = vals[joint_var][0] - current_pose[0]
+    diff = (diff + jnp.pi) % (2 * jnp.pi) - jnp.pi  # Normalize to [-π, π]
+    residual = jnp.maximum(0.0, threshold - jnp.abs(diff))**2
+
+    # Last joint deviation with angle normalization
+    diff_ee = vals[joint_var][-1] - current_pose[-1]
+    diff_ee = (diff_ee + jnp.pi) % (2 * jnp.pi) - jnp.pi  # Normalize to [-π, π]
+    residual_ee = jnp.maximum(0.0, threshold - jnp.abs(diff_ee))**2
+
+    return ((residual + residual_ee) * weight).flatten()
+
+
+@Cost.create_factory
+def elbow_height_cost(
+    vals: VarValues,
+    robot: Robot,
+    joint_var: Var[Array],
+    link_index: int | Array,
+    weight: Array | float,
+) -> Array:
+    """Penalizes low link height. Higher z-coordinate = lower cost.
+
+    Args:
+        link_index: Index of the link to track.
+        weight: Cost weight.
+    """
+    cfg = vals[joint_var]
+    Ts_link_world = robot.forward_kinematics(cfg)
+    # Get z-coordinate (height) of the specified link
+    link_z = jaxlie.SE3(Ts_link_world[link_index]).translation()[2]
+
+    # Clip to non-negative values to avoid division by negative numbers
+    link_z = jnp.maximum(0.0, link_z)
+
+    # Penalize low height: cost = 1 / (z + epsilon)
+    # Lower z -> higher cost
+    residual = 1.0 / (link_z + 0.1)  # epsilon=0.1 for numerical stability
+    return (residual * weight).flatten()
+
+
+@Cost.create_factory
 def rest_with_base_cost(
     vals: VarValues,
     joint_var: Var[Array],
