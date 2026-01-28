@@ -10,11 +10,9 @@ import numpy as np
 import pyroki_snippets as pks
 import trimesh
 import viser
-from robot_descriptions.loaders.yourdfpy import (load_robot_description,
-                                                 yourdfpy)
+from robot_descriptions.loaders.yourdfpy import load_robot_description, yourdfpy
 from viser.extras import ViserUrdf
-from wutility import (voxel_fit_volume_inside_mesh,
-                      voxel_fit_volume_sample_surface_mesh)
+from wutility import voxel_fit_volume_inside_mesh, voxel_fit_volume_sample_surface_mesh
 
 import pyroki as pk
 from pyroki.collision import Capsule, RobotCollision
@@ -27,7 +25,7 @@ def main():
     # target_link_name = "panda_hand"
 
     urdf = yourdfpy.URDF.load(
-        str(Path(__file__).parent / '../wur5e/ur5e.urdf'))
+        str(Path(__file__).parent / '../ur5e/ur5e.urdf'))
     target_link_name = "tool0"
 
     # Create robot.
@@ -41,8 +39,11 @@ def main():
 
     # Create interactive controller with initial position.
     ik_target = server.scene.add_transform_controls(
-        "/ik_target", scale=0.2, position=(0.2566333,  0.1340796, 0.5996458),
-        wxyz=(0, -0.707, 0.707, 0)
+        "/ik_target", scale=0.2,
+        # position=(0.2566333,  0.1340796, 0.5996458),
+        # wxyz=(0, -0.707, 0.707, 0)
+        position=(0.33980408, -0.12158905, 0.5132406),
+        wxyz=(0, 0.707, -0.707, 0)
         # wxyz=(0, -0.707, 0, 0.707)
     )
     timing_handle = server.gui.add_number("Elapsed (ms)", 0.001, disabled=True)
@@ -56,6 +57,7 @@ def main():
     mybutton = server.gui.add_button(
         label="mybutton",  # ボタンに表示されるテキスト
     )
+    server.gui.configure_theme(dark_mode=True)
 
     @mybutton.on_click
     def _(_) -> None:
@@ -71,7 +73,7 @@ def main():
     server.scene.add_mesh_trimesh("/imported_mesh",
                                   mesh=mesh,
                                   # wxyz=(0.707, 0.707, 0, 0),
-                                  # position=(0.75, -0.3, 0)
+                                  position=(0.75, -0.3, 0)
                                   )
 
     # pts, radius = voxel_fit_volume_inside_mesh(mesh, n_spheres=200)

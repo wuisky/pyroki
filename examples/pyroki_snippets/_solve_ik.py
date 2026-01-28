@@ -116,7 +116,7 @@ def _solve_ik_jax(
         jaxls.LeastSquaresProblem(factors, [joint_var])
         .analyze()
         .solve(
-            # initial_vals=init_vals,
+            initial_vals=init_vals,
             verbose=False,
             linear_solver="dense_cholesky",
             trust_region=jaxls.TrustRegionConfig(lambda_initial=1.0),
