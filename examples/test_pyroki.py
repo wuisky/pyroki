@@ -20,7 +20,8 @@ def main():
     """Main function for basic IK."""
     # urdf = load_robot_description("ur5_description")
     urdf = yourdfpy.URDF.load(
-        str(Path(__file__).parent / '../ur5-bullet/UR5/ur_e_description/urdf/ur5e.urdf'))
+        str(Path(__file__).parent / '../ur5e/ur5e.urdf'))
+    # str(Path(__file__).parent / '../ur5-bullet/UR5/ur_e_description/urdf/ur5e.urdf'))
     target_link_name = "tool0"
 
     # print(f'{urdf.link_map.values()=}')
