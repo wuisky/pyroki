@@ -23,8 +23,10 @@ def solve_ik_with_collision(
     target_wxyz: onp.ndarray,
     weights: Optional[onp.ndarray] = None,
     pose_weight: float = 5.0,
-    rest_weight: float = 0.01,
+    rest_weight: float | onp.ndarray = 0.01,
     initial_joint_angles: Optional[onp.ndarray] = None,
+    elbow_height_weight: float = 0.0,
+    elbow_link_name: str = "forearm_link",
 ) -> onp.ndarray:
     """
     Solves the basic IK problem for a robot.
@@ -44,6 +46,9 @@ def solve_ik_with_collision(
     assert target_position.shape == (3,) and target_wxyz.shape == (4,)
     target_link_idx = robot.links.names.index(target_link_name)
 
+    # Convert elbow link name to index
+    elbow_link_idx = robot.links.names.index(elbow_link_name)
+
     T_world_targets = jaxlie.SE3(
         jnp.concatenate([jnp.array(target_wxyz), jnp.array(target_position)], axis=-1)
     )
@@ -56,8 +61,10 @@ def solve_ik_with_collision(
         weights,
         pose_weight,
         rest_weight,
-        # jnp.array(initial_joint_angles),
-        initial_joint_angles if initial_joint_angles is not None else robot.joint_var_cls.default_factory(),
+        jnp.array(
+            initial_joint_angles) if initial_joint_angles is not None else robot.joint_var_cls.default_factory(),
+        elbow_height_weight,
+        jnp.array(elbow_link_idx, dtype=jnp.int32),  # Pass index instead of name
     )
     assert cfg.shape == (robot.joints.num_actuated_joints,)
 
@@ -73,8 +80,10 @@ def _solve_ik_with_collision_jax(
     target_link_index: jax.Array,
     weights: onp.ndarray,
     pose_weight: float,
-    rest_weight: float,
+    rest_weight: float | jax.Array,
     initial_joint_angles: jnp.ndarray,
+    elbow_height_weight: float,
+    elbow_link_index: jax.Array,  # Changed from str to jax.Array
 ) -> jax.Array:
     """Solves the basic IK problem with collision avoidance. Returns joint configuration."""
     # original_default = robot.joint_var_cls.default_factory()
@@ -82,8 +91,11 @@ def _solve_ik_with_collision_jax(
     joint_var = robot.joint_var_cls(0)  # 0 is for id
     vars = [joint_var]
 
-    jax.debug.print("ini_q: {x}", x=initial_joint_angles)
+    # jax.debug.print("ini_q: {x}", x=initial_joint_angles)
     init_vals = jaxls.VarValues.make([vars[0].with_value(initial_joint_angles)])
+    # init_vals = jaxls.VarValues.make({joint_var: initial_joint_angles})
+
+    # jax.debug.print("rest val {q}", q=joint_var.default_factory())
 
     # Weights and margins defined directly in factors
     costs = [
@@ -92,10 +104,10 @@ def _solve_ik_with_collision_jax(
             joint_var,
             target_pose=T_world_target,
             target_link_index=target_link_index,
-            # pos_weight=5.0,
-            # ori_weight=1.0,
+            # pos_weight=50.0,
+            # ori_weight=10.0,
             pos_weight=pose_weight,
-            ori_weight=pose_weight,
+            ori_weight=pose_weight/5.0,
         ),
         pk.costs.limit_cost(
             robot,
@@ -106,9 +118,15 @@ def _solve_ik_with_collision_jax(
         # todo switch rest_pose to latest joint configuration
         pk.costs.rest_cost(
             joint_var,
-            rest_pose=jnp.array(joint_var.default_factory()),
-            # weight=0.01,
+            # rest_pose=jnp.array(joint_var.default_factory()),
+            rest_pose=initial_joint_angles,
             weight=rest_weight,
+        ),
+        pk.costs.elbow_height_cost(
+            robot,
+            joint_var,
+            link_index=elbow_link_index,
+            weight=elbow_height_weight,
         ),
         # pk.costs.self_collision_cost(
         #     robot,
@@ -117,6 +135,7 @@ def _solve_ik_with_collision_jax(
         #     margin=0.02,
         #     weight=5.0,
         # ),
+
     ]
     costs.extend(
         [
@@ -130,9 +149,11 @@ def _solve_ik_with_collision_jax(
     sol = (
         jaxls.LeastSquaresProblem(costs, vars)
         .analyze()
-        .solve(verbose=False,
-               initial_vals=init_vals,
-               linear_solver="dense_cholesky",
-               )
+        .solve(
+            initial_vals=init_vals,
+            verbose=False,
+            linear_solver="dense_cholesky",
+            trust_region=jaxls.TrustRegionConfig(lambda_initial=1.0),
+        )
     )
     return sol[joint_var]
