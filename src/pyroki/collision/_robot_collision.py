@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional, Tuple, cast
 
+import numpy as onp
 import jax
 import jax.numpy as jnp
 import jax_dataclasses as jdc
@@ -34,6 +35,9 @@ class RobotCollision:
     """Row indices (first link) of active self-collision pairs to check."""
     active_idx_j: Int[Array, " P"]
     """Column indices (second link) of active self-collision pairs to check."""
+
+    num_spheres_per_link: jdc.Static[tuple[int, ...]] = None
+    """Number of actual spheres per link (excluding padding). None for capsule-based models."""
 
     @staticmethod
     def from_urdf(
@@ -314,8 +318,6 @@ class RobotCollision:
             sphere_list.append(s)
 
         spheres = cast(Sphere, jax.tree.map(lambda *args: jnp.stack(args), *sphere_list))
-        # assert spheres.get_batch_axes() == (link_info.num_links,)
-        print(f'{spheres.get_batch_axes()=}')
 
         # Directly compute active pair indices
         active_idx_i, active_idx_j = RobotCollision._compute_active_pair_indices(
@@ -336,6 +338,7 @@ class RobotCollision:
             active_idx_i=active_idx_i,
             active_idx_j=active_idx_j,
             coll=spheres,
+            num_spheres_per_link=tuple(num_spheres_per_link),
         )
 
     @staticmethod
@@ -368,8 +371,6 @@ class RobotCollision:
 
         if radius:
             spheres = Sphere.from_center_and_radius(center=jnp.array(pts), radius=jnp.array(radius))
-            # print(f'{jnp.array(pts).shape=} {jnp.array(radius).shape=}' )
-            print(f'{link_name}: {spheres.get_batch_axes()=}')
             return spheres
         else:
             return None
@@ -401,7 +402,16 @@ class RobotCollision:
         Ts_link_world_wxyz_xyz = robot.forward_kinematics(cfg)
         Ts_link_world = jaxlie.SE3(Ts_link_world_wxyz_xyz)
 
-        return self.coll.transform(Ts_link_world)
+        # Handle nested batch dimensions (e.g., multiple spheres per link)
+        coll_batch_axes = self.coll.get_batch_axes()
+        if len(coll_batch_axes) > 1:
+            # Expand transform dimensions to match collision geometry
+            # Transform shape: (num_links,) -> (num_links, 1, ..., 1)
+            expand_dims = tuple([slice(None)] + [None] * (len(coll_batch_axes) - 1))
+            Ts_expanded = jax.tree.map(lambda x: x[expand_dims], Ts_link_world)
+            return self.coll.transform(Ts_expanded)
+        else:
+            return self.coll.transform(Ts_link_world)
 
     def get_swept_capsules(
         self,
@@ -481,10 +491,55 @@ class RobotCollision:
 
         # 1. Get collision geometry at the current config
         coll = self.at_config(robot, cfg)
-        assert coll.get_batch_axes() == (*batch_axes, self.num_links)
+        coll_batch_axes = coll.get_batch_axes()
+
+        # Handle nested batch dimensions (e.g., multiple spheres per link)
+        if len(coll_batch_axes) > len(batch_axes) + 1:
+            # Flatten nested dimensions: (batch, num_links, num_spheres) -> (batch, num_links*num_spheres)
+            nested_shape = coll_batch_axes[len(batch_axes):]
+            flattened_size = int(jnp.prod(jnp.array(nested_shape)))
+            coll = coll.reshape((*batch_axes, flattened_size))
+
+        assert coll.get_batch_axes() == (
+            *batch_axes, self.num_links) or len(coll.get_batch_axes()) == len(batch_axes) + 1
 
         # 2. Compute all pairwise distances using the imported function
         dist_matrix = pairwise_collide(coll, coll)
+
+        # For flattened case, we need to compute minimum distances between link groups
+        if len(coll_batch_axes) > len(batch_axes) + 1:
+            # Reshape distance matrix to group by links
+            num_spheres_per_link_max = coll_batch_axes[-1]
+            dist_matrix_reshaped = dist_matrix.reshape(
+                *batch_axes, self.num_links, num_spheres_per_link_max,
+                self.num_links, num_spheres_per_link_max
+            )
+
+            # If num_spheres_per_link info is available, mask out padding spheres
+            if self.num_spheres_per_link is not None:
+                # Create mask for valid spheres (non-padding)
+                mask_i = jnp.array([
+                    [i < self.num_spheres_per_link[link]
+                     for i in range(num_spheres_per_link_max)]
+                    for link in range(self.num_links)
+                ])  # Shape: (num_links, num_spheres_per_link_max)
+
+                mask_j = mask_i  # Same mask for both dimensions
+
+                # Broadcast masks to match dist_matrix_reshaped shape
+                # Shape: (num_links, num_spheres_max, num_links, num_spheres_max)
+                mask_combined = mask_i[:, :, None, None] & mask_j[None, None, :, :]
+
+                # Set invalid (padding) distances to a large value (inf)
+                dist_matrix_reshaped = jnp.where(
+                    mask_combined,
+                    dist_matrix_reshaped,
+                    jnp.inf
+                )
+
+            # Take minimum distance between any pair of valid spheres from two different links
+            dist_matrix = jnp.min(dist_matrix_reshaped, axis=(-1, -3))
+
         assert dist_matrix.shape == (
             *batch_axes,
             self.num_links,
@@ -525,11 +580,29 @@ class RobotCollision:
             Shape: (*batch_combined, N, M), where N=num_links, M=num_world_objects.
             Positive distance means separation, negative means penetration.
         """
+        batch_cfg_shape = cfg.shape[:-1]
+
         # 1. Get robot collision geometry at the current config
-        # Shape: (*batch_cfg, N, ...)
+        # Shape: (*batch_cfg, N, ...) or (*batch_cfg, N, num_spheres)
         coll_robot_world = self.at_config(robot, cfg)
         N = self.num_links
-        assert coll_robot_world.get_batch_axes()[-1] == N
+        coll_batch_axes = coll_robot_world.get_batch_axes()
+
+        # Determine if we have nested dimensions based on static information
+        # Handle nested batch dimensions (e.g., multiple spheres per link)
+        has_nested_dims = len(coll_batch_axes) > len(batch_cfg_shape) + 1
+        if has_nested_dims:
+            # Flatten nested dimensions: (*batch, num_links, num_spheres) -> (*batch, num_links*num_spheres)
+            nested_shape = coll_batch_axes[len(batch_cfg_shape):]
+            # Use static shape calculation
+            flattened_size = int(onp.prod(nested_shape))
+            num_spheres_per_link_max = nested_shape[-1]
+            coll_robot_world = coll_robot_world.reshape((*batch_cfg_shape, flattened_size))
+            coll_batch_axes = coll_robot_world.get_batch_axes()
+        else:
+            num_spheres_per_link_max = None
+
+        assert coll_robot_world.get_batch_axes()[-1] == N or has_nested_dims
         batch_cfg_shape = coll_robot_world.get_batch_axes()[:-1]
 
         # 2. Normalize world_geom shape and determine M
@@ -544,10 +617,39 @@ class RobotCollision:
             M = world_axes[-1]
             batch_world_shape = world_axes[:-1]
 
-        # 3. Compute distances: Map collide over robot links (axis -2) vs _world_geom (None)
-        # _world_geom is guaranteed to have the M axis now.
-        _collide_links_vs_world = jax.vmap(collide, in_axes=(-2, None), out_axes=(-2))
-        dist_matrix = _collide_links_vs_world(coll_robot_world, _world_geom)
+        # 3. Compute distances
+        if has_nested_dims:
+            # For flattened spheres: compute all distances then group by links
+            _collide_links_vs_world = jax.vmap(collide, in_axes=(-2, None), out_axes=(-2))
+            dist_matrix_flat = _collide_links_vs_world(coll_robot_world, _world_geom)
+
+            # Reshape to group by links and take minimum per link
+            dist_matrix_reshaped = dist_matrix_flat.reshape(
+                *batch_cfg_shape, N, num_spheres_per_link_max, M
+            )
+            if self.num_spheres_per_link is not None:
+                mask = jnp.array([
+                    [i < self.num_spheres_per_link[link]
+                     for i in range(num_spheres_per_link_max)]
+                    for link in range(N)
+                ])  # Shape: (N, num_spheres_max)
+
+                # Broadcast mask: (N, num_spheres_max) -> (N, num_spheres_max, 1)
+                mask_expanded = mask[:, :, None]
+
+                # Set invalid distances to inf
+                dist_matrix_reshaped = jnp.where(
+                    mask_expanded,
+                    dist_matrix_reshaped,
+                    jnp.inf
+                )
+
+            # Take minimum distance per link
+            dist_matrix = jnp.min(dist_matrix_reshaped, axis=-2)
+        else:
+            # Original logic for single collision per link
+            _collide_links_vs_world = jax.vmap(collide, in_axes=(-2, None), out_axes=(-2))
+            dist_matrix = _collide_links_vs_world(coll_robot_world, _world_geom)
 
         # 4. Result shape check
         # Calculate expected shape based on broadcasting rules
