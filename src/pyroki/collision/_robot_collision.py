@@ -48,6 +48,7 @@ class RobotCollision:
         parent_link_name: str,
         spheres: Sphere,
         ignore_self_collision: bool = False,
+        offset: jaxlie.SE3 | None = None,
     ) -> "RobotCollision":
         """
         Attach a new link with collision spheres to an existing parent link.
@@ -57,6 +58,8 @@ class RobotCollision:
             parent_link_name: Name of the existing link to attach to.
             spheres: Sphere collision geometry for the new link (in parent link's local frame).
             ignore_self_collision: If True, ignore collisions between new link and parent.
+            offset: SE3 transformation offset from parent link frame to new link frame.
+                    If None, spheres are used as-is in parent's local frame.
 
         Returns:
             New RobotCollision instance with the attached link.
@@ -123,6 +126,16 @@ class RobotCollision:
         # Add new link
         center = spheres.pose.translation()
         radius = spheres.radius
+
+        # Apply offset transformation if provided
+        if offset is not None:
+            # Transform sphere centers by the offset
+            center_homogeneous = jnp.concatenate(
+                [center, jnp.ones((center.shape[0], 1), dtype=center.dtype)], axis=-1)
+            offset_matrix = offset.as_matrix()
+            center_transformed = (offset_matrix @ center_homogeneous.T).T
+            center = center_transformed[:, :3]
+
         if center.shape[0] < new_max_spheres:
             pad = new_max_spheres - center.shape[0]
             center = jnp.concatenate(
@@ -171,6 +184,104 @@ class RobotCollision:
             coll=new_coll,
             num_spheres_per_link=tuple(new_num_spheres_per_link),
             parent_link_indices=new_parent_indices,
+        )
+
+    def update_link_spheres(
+        self,
+        link_name: str,
+        new_spheres: Sphere,
+        offset: jaxlie.SE3 | None = None,
+    ) -> "RobotCollision":
+        """
+        Update the collision spheres of an existing link without changing the model structure.
+        This avoids JIT recompilation by keeping the same number of spheres.
+
+        Args:
+            link_name: Name of the link to update.
+            new_spheres: New sphere collision geometry. Must have the same batch size
+                        as the current spheres for this link to avoid recompilation.
+            offset: Optional SE3 transformation to apply to the new spheres.
+
+        Returns:
+            New RobotCollision instance with updated spheres for the specified link.
+
+        Raises:
+            ValueError: If link not found or sphere count mismatch.
+        """
+        if link_name not in self.link_names:
+            raise ValueError(f"Link '{link_name}' not found in robot collision model")
+
+        if not isinstance(self.coll, Sphere):
+            raise TypeError("update_link_spheres only works with Sphere-based collision models")
+
+        if self.num_spheres_per_link is None:
+            raise ValueError("Cannot update link without sphere count tracking")
+
+        link_idx = self.link_names.index(link_name)
+        current_max_spheres = self.coll.get_batch_axes()[-1]
+
+        # Get new sphere data
+        new_batch_axes = new_spheres.get_batch_axes()
+        if len(new_batch_axes) == 0:
+            num_new_spheres = 1
+            new_spheres = new_spheres.broadcast_to((1,))
+        else:
+            num_new_spheres = new_batch_axes[0]
+
+        # Verify sphere count matches to avoid recompilation
+        current_num_spheres = self.num_spheres_per_link[link_idx]
+        if num_new_spheres != current_num_spheres:
+            raise ValueError(
+                f"Sphere count mismatch: link '{link_name}' currently has {current_num_spheres} "
+                f"spheres, but new_spheres has {num_new_spheres}. Counts must match to avoid "
+                f"JIT recompilation."
+            )
+
+        # Extract new sphere centers and radii
+        center = new_spheres.pose.translation()
+        radius = new_spheres.radius
+
+        # Apply offset transformation if provided
+        if offset is not None:
+            center_homogeneous = jnp.concatenate(
+                [center, jnp.ones((center.shape[0], 1), dtype=center.dtype)], axis=-1)
+            offset_matrix = offset.as_matrix()
+            center_transformed = (offset_matrix @ center_homogeneous.T).T
+            center = center_transformed[:, :3]
+
+        # Pad to max spheres
+        if center.shape[0] < current_max_spheres:
+            pad = current_max_spheres - center.shape[0]
+            center = jnp.concatenate(
+                [center, jnp.zeros((pad, 3), dtype=center.dtype)], axis=0)
+            radius = jnp.concatenate(
+                [radius, jnp.zeros((pad,), dtype=radius.dtype)], axis=0)
+
+        # Reconstruct collision geometry with updated spheres
+        new_sphere_list = []
+        for i in range(self.num_links):
+            if i == link_idx:
+                # Use new spheres for this link
+                new_sphere_list.append(Sphere.from_center_and_radius(center, radius))
+            else:
+                # Keep existing spheres
+                link_spheres = jax.tree.map(lambda x: x[i], self.coll)
+                existing_center = link_spheres.pose.translation()
+                existing_radius = link_spheres.radius
+                new_sphere_list.append(
+                    Sphere.from_center_and_radius(existing_center, existing_radius))
+
+        # Stack all spheres
+        new_coll = cast(Sphere, jax.tree.map(lambda *args: jnp.stack(args), *new_sphere_list))
+
+        return RobotCollision(
+            num_links=self.num_links,
+            link_names=self.link_names,
+            active_idx_i=self.active_idx_i,
+            active_idx_j=self.active_idx_j,
+            coll=new_coll,
+            num_spheres_per_link=self.num_spheres_per_link,
+            parent_link_indices=self.parent_link_indices,
         )
 
     def detach_link(

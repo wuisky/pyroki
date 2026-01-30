@@ -195,16 +195,62 @@ def main():
     hand_mesh.apply_scale(0.001)
     sphere_hand_mesh = spherelize_mesh(hand_mesh, n_spheres=100, sphere_radius=0.002)
 
+    offset = jaxlie.SE3.from_rotation_and_translation(
+        rotation=jaxlie.SO3.identity(),
+        translation=jnp.array([0.0, 0.0, 0.1])  # Z軸方向に10cm
+    )
+
     # Attach hand as a new link to tool0
     robot_coll = robot_coll.attach_link(
         new_link_name='hand_gripper',
         parent_link_name='tool0',
         spheres=sphere_hand_mesh,
-        ignore_self_collision=True  # Ignore collision between hand and tool0
+        ignore_self_collision=True,  # Ignore collision between hand and tool0
     )
     print(f'After attaching hand: {robot_coll.link_names=}')
     print(f'After attaching hand: {robot_coll.num_spheres_per_link=}')
     print(f'After attaching hand: {robot_coll.parent_link_indices=}')
+
+    # Create 100 spheres with radius 0 at origin
+    dummy_centers = np.zeros((100, 3))  # All at [0, 0, 0]
+    dummy_radii = np.zeros(100)  # All radius = 0
+    dummy_obj = Sphere.from_center_and_radius(dummy_centers, dummy_radii)
+
+    robot_coll = robot_coll.attach_link(
+        new_link_name='object',
+        parent_link_name='tool0',
+        spheres=dummy_obj,
+        ignore_self_collision=True,  # Ignore collision between hand and tool0
+        offset=offset
+    )
+
+    obj_mesh = trimesh.load_mesh(
+        str(Path(__file__).parent / '../cad/Bunny.stl'))
+    obj_mesh.apply_scale(0.001)
+    obj_spheres_raw = spherelize_mesh(obj_mesh, n_spheres=100, sphere_radius=0.002)
+
+    server.scene.add_mesh_trimesh(
+        "/bunny", mesh=obj_mesh, position=(0, 1, 0))
+
+    # Ensure exactly 100 spheres by padding if necessary
+    obj_centers = obj_spheres_raw.pose.translation()
+    obj_radii = obj_spheres_raw.radius
+    num_obj_spheres = obj_centers.shape[0]
+
+    if num_obj_spheres < 100:
+        # Pad to 100 spheres with zero radius
+        pad = 100 - num_obj_spheres
+        obj_centers = jnp.concatenate(
+            [obj_centers, jnp.zeros((pad, 3), dtype=obj_centers.dtype)], axis=0)
+        obj_radii = jnp.concatenate(
+            [obj_radii, jnp.zeros((pad,), dtype=obj_radii.dtype)], axis=0)
+    elif num_obj_spheres > 100:
+        # Truncate to 100 spheres
+        obj_centers = obj_centers[:100]
+        obj_radii = obj_radii[:100]
+
+    obj_spheres = Sphere.from_center_and_radius(obj_centers, obj_radii)
+    print(f'Object spheres: {obj_spheres.get_batch_axes()[0]} spheres')
 
     mesh = trimesh.load_mesh(str(Path(__file__).parent / 'storage_box.stl'))
     mesh.apply_scale(0.005)
@@ -226,12 +272,45 @@ def main():
     )
 
     detach_hand = server.gui.add_button(
-        label="Detach Hand",  # ボタンに表示されるテキスト
+        label="Detach Hand",
     )
 
     solve_ik = server.gui.add_button(
-        label="Solve IK",  # ボタンに表示されるテキスト
+        label="Solve IK",
     )
+
+    grasp_object = server.gui.add_button(
+        label="Grasp Object",
+    )
+
+    release_object = server.gui.add_button(
+        label="Release Object",
+    )
+
+    @grasp_object.on_click
+    def _(_) -> None:
+        nonlocal robot_coll
+        # Update 'object' link spheres with actual object geometry
+        robot_coll = robot_coll.update_link_spheres(
+            link_name='object',
+            new_spheres=obj_spheres,
+            offset=offset
+        )
+        print(f'Object grasped: {robot_coll.num_spheres_per_link=}')
+
+    @release_object.on_click
+    def _(_) -> None:
+        nonlocal robot_coll
+        # Reset 'object' link spheres to zero radius (invisible)
+        dummy_centers = np.zeros((100, 3))
+        dummy_radii = np.zeros(100)
+        dummy_obj = Sphere.from_center_and_radius(dummy_centers, dummy_radii)
+        robot_coll = robot_coll.update_link_spheres(
+            link_name='object',
+            new_spheres=dummy_obj,
+            offset=offset
+        )
+        print(f'Object released: {robot_coll.num_spheres_per_link=}')
 
     @detach_hand.on_click
     def _(_) -> None:
