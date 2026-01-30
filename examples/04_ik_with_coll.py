@@ -193,7 +193,7 @@ def main():
     hand_mesh = trimesh.load_mesh(
         str(Path(__file__).parent / '../cad/robotiq_2F_adaptive_gripper_rough.STL'))
     hand_mesh.apply_scale(0.001)
-    sphere_hand_mesh = spherelize_mesh(hand_mesh, n_spheres=500, sphere_radius=0.002)
+    sphere_hand_mesh = spherelize_mesh(hand_mesh, n_spheres=100, sphere_radius=0.002)
 
     # Attach hand as a new link to tool0
     robot_coll = robot_coll.attach_link(
@@ -217,7 +217,7 @@ def main():
     server.scene.add_mesh_trimesh("/box/visual", mesh=mesh)
     # pts, radius = voxel_fit_volume_sample_surface_mesh(mesh, n_spheres=500,
     #                                                    surface_sphere_radius=0.005)
-    pts, radius = sample_even_fit_mesh(mesh, n_spheres=500, sphere_radius=0.005)
+    pts, radius = sample_even_fit_mesh(mesh, n_spheres=200, sphere_radius=0.005)
     print(f'{type(pts)=}, {pts=}')
     box_spheres = pk.collision.Sphere.from_center_and_radius(
         center=pts, radius=radius)
