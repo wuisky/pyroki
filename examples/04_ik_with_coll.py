@@ -26,7 +26,7 @@ def display_link_frames(
     solution: np.ndarray,
     axes_length: float = 0.15,
     axes_radius: float = 0.002,
-) -> None:
+) -> jnp.ndarray:
     """Display coordinate frames for each link of the robot.
 
     Args:
@@ -54,6 +54,7 @@ def display_link_frames(
             axes_length=axes_length,
             axes_radius=axes_radius,
         )
+    return Ts_link_world
 
 
 def create_robot_control_sliders(
@@ -87,6 +88,15 @@ def create_robot_control_sliders(
     return slider_handles, initial_config
 
 
+def spherelize_mesh(mesh: trimesh.Trimesh, n_spheres=500,
+                    sphere_radius=0.005) -> pk.collision.Sphere:
+    pts, radius = sample_even_fit_mesh(mesh, n_spheres=n_spheres,
+                                       sphere_radius=sphere_radius)
+    spheres = pk.collision.Sphere.from_center_and_radius(
+        center=pts, radius=radius)
+    return spheres
+
+
 def main():
     """Main function for basic IK with collision."""
     # urdf = load_robot_description("panda_description")
@@ -97,12 +107,14 @@ def main():
     #     str(Path(__file__).parent / '../ur5-bullet/UR5/ur_e_description/urdf/ur5e.urdf'))
     # target_link_name = "ee_link"
 
-    urdf_path = str(Path(__file__).parent / '../ur5e/ur5e.urdf')
+    # urdf_path = str(Path(__file__).parent / '../ur5e/ur5e.urdf')
+    urdf_path = str(Path(__file__).parent / '../ur5e/ur5e.urdf.sphere')
     urdf = yourdfpy.URDF.load(urdf_path)
     target_link_name = "tool0"
 
     robot = pk.Robot.from_urdf(urdf)
-    robot_coll = RobotCollision.from_urdf(urdf)
+    # robot_coll = RobotCollision.from_urdf(urdf)
+    robot_coll = RobotCollision.from_urdf_spheres(urdf)
     print(f'{robot_coll=}')
     new_default = jnp.array([0.0, -1.57, 0., -1.57, 0., 0.], dtype=jnp.float32)
     robot.joint_var_cls.default_factory = staticmethod(lambda: new_default)
@@ -178,32 +190,60 @@ def main():
     # calc_collision = server.gui.add_checkbox("collision",
     #                                          initial_value=True)
 
-    # mesh = trimesh.load_mesh("storage_box.stl")
-    # mesh.apply_scale(0.005)
-    # box_handle = server.scene.add_transform_controls(
-    #     "/box", scale=0.2,
-    #     wxyz=(0.707, 0.707, 0, 0),
-    #     position=(0.75, -0.3, 0)
-    # )
-    # # viserで可視化
-    # server.scene.add_mesh_trimesh("/box/visual", mesh=mesh)
-    # # pts, radius = voxel_fit_volume_sample_surface_mesh(mesh, n_spheres=500,
-    # #                                                    surface_sphere_radius=0.005)
-    # pts, radius = sample_even_fit_mesh(mesh, n_spheres=500, sphere_radius=0.005)
-    # print(f'{type(pts)=}, {pts=}')
-    # box_spheres = pk.collision.Sphere.from_center_and_radius(
-    #     center=pts, radius=radius)
-    # server.scene.add_mesh_trimesh(
-    #     "/box/coll", mesh=box_spheres.to_trimesh(),
-    # )
+    hand_mesh = trimesh.load_mesh(
+        str(Path(__file__).parent / '../cad/robotiq_2F_adaptive_gripper_rough.STL'))
+    hand_mesh.apply_scale(0.001)
+    sphere_hand_mesh = spherelize_mesh(hand_mesh, n_spheres=500, sphere_radius=0.002)
+
+    # Attach hand as a new link to tool0
+    robot_coll = robot_coll.attach_link(
+        new_link_name='hand_gripper',
+        parent_link_name='tool0',
+        spheres=sphere_hand_mesh,
+        ignore_self_collision=True  # Ignore collision between hand and tool0
+    )
+    print(f'After attaching hand: {robot_coll.link_names=}')
+    print(f'After attaching hand: {robot_coll.num_spheres_per_link=}')
+    print(f'After attaching hand: {robot_coll.parent_link_indices=}')
+
+    mesh = trimesh.load_mesh(str(Path(__file__).parent / 'storage_box.stl'))
+    mesh.apply_scale(0.005)
+    box_handle = server.scene.add_transform_controls(
+        "/box", scale=0.2,
+        wxyz=(0.707, 0.707, 0, 0),
+        position=(0.75, -0.3, 0)
+    )
+    # viserで可視化
+    server.scene.add_mesh_trimesh("/box/visual", mesh=mesh)
+    # pts, radius = voxel_fit_volume_sample_surface_mesh(mesh, n_spheres=500,
+    #                                                    surface_sphere_radius=0.005)
+    pts, radius = sample_even_fit_mesh(mesh, n_spheres=500, sphere_radius=0.005)
+    print(f'{type(pts)=}, {pts=}')
+    box_spheres = pk.collision.Sphere.from_center_and_radius(
+        center=pts, radius=radius)
+    server.scene.add_mesh_trimesh(
+        "/box/coll", mesh=box_spheres.to_trimesh(),
+    )
+
+    detach_hand = server.gui.add_button(
+        label="Detach Hand",  # ボタンに表示されるテキスト
+    )
 
     solve_ik = server.gui.add_button(
         label="Solve IK",  # ボタンに表示されるテキスト
     )
 
+    @detach_hand.on_click
+    def _(_) -> None:
+        nonlocal robot_coll
+        # Detach the hand gripper link
+        robot_coll = robot_coll.detach_link('hand_gripper')
+        print(f'After detaching: {robot_coll.link_names=}')
+        print(f'After detaching: {robot_coll.num_spheres_per_link=}')
+
     @solve_ik.on_click
     def _(_) -> None:
-        nonlocal prev_solution  # グローバル変数を参照・上書きするために必要
+        nonlocal prev_solution
         sphere_coll_world_current = sphere_coll.transform_from_wxyz_position(
             wxyz=np.array(sphere_handle.wxyz),
             position=np.array(sphere_handle.position),
@@ -261,20 +301,20 @@ def main():
             position=np.array(sphere_handle.position),
         )
 
-        # # storage box
-        # box_coll_world_current = box_spheres.transform_from_wxyz_position(
-        #     wxyz=np.array(box_handle.wxyz),
-        #     position=np.array(box_handle.position),
-        # )
+        # storage box
+        box_coll_world_current = box_spheres.transform_from_wxyz_position(
+            wxyz=np.array(box_handle.wxyz),
+            position=np.array(box_handle.position),
+        )
 
         # world_coll_list = [plane_coll, sphere_coll_world_current]
-        # world_coll_list = [sphere_coll_world_current,
-        #                    box_coll_world_current]
-        world_coll_list = [sphere_coll_world_current]
-        weights = np.ones(len(world_coll_list)) * 10.0
+        world_coll_list = [sphere_coll_world_current,
+                           box_coll_world_current]
+        # world_coll_list = [sphere_coll_world_current]
+        weights = np.ones(len(world_coll_list)) * collision_weight.value
         # if not calc_collision.value:
         #     weights[-1] = 0.0
-        weights[-1] = collision_weight.value
+        # weights[-1] = collision_weight.value
 
         # for rest weight per joint
         rest_weights = np.array([rest_weight.value] * robot.joints.num_actuated_joints)
@@ -331,13 +371,22 @@ def main():
             "/robot_coll", mesh=robot_coll_mesh, visible=False)
 
         # Display coordinate frames for each link
-        display_link_frames(server, robot, solution)
+        Ts_link_world = display_link_frames(server, robot, solution)
         # target_link_index = robot.links.names.index('forearm_link')
         # pos = jaxlie.SE3(Ts_link_world[target_link_index]).translation()[2]
         # print(f'forearm_link position: {pos}')
         # server.scene.remove_by_name("/robot_coll")
         # time.sleep(1)
         # break
+        # tool_index = robot.links.names.index('tool0')
+        # tool_pose = jaxlie.SE3(Ts_link_world[tool_index])
+        # wxyz_xyz = tool_pose.wxyz_xyz
+        # server.scene.add_mesh_trimesh(
+        #     "/robot/hand",
+        #     mesh=sphere_hand_mesh.to_trimesh(),
+        #     wxyz=np.array(wxyz_xyz[:4]),
+        #     position=np.array(wxyz_xyz[4:]),
+        # )
 
 
 if __name__ == "__main__":

@@ -39,6 +39,247 @@ class RobotCollision:
     num_spheres_per_link: jdc.Static[tuple[int, ...]] = None
     """Number of actual spheres per link (excluding padding). None for capsule-based models."""
 
+    parent_link_indices: jdc.Static[tuple[int, ...]] = None
+    """Parent link index for each link. None for root links or models without attachment tracking."""
+
+    def attach_link(
+        self,
+        new_link_name: str,
+        parent_link_name: str,
+        spheres: Sphere,
+        ignore_self_collision: bool = False,
+    ) -> "RobotCollision":
+        """
+        Attach a new link with collision spheres to an existing parent link.
+
+        Args:
+            new_link_name: Name for the new link to create.
+            parent_link_name: Name of the existing link to attach to.
+            spheres: Sphere collision geometry for the new link (in parent link's local frame).
+            ignore_self_collision: If True, ignore collisions between new link and parent.
+
+        Returns:
+            New RobotCollision instance with the attached link.
+        """
+        if new_link_name in self.link_names:
+            raise ValueError(f"Link '{new_link_name}' already exists in robot collision model")
+
+        if parent_link_name not in self.link_names:
+            raise ValueError(f"Parent link '{parent_link_name}' not found in robot collision model")
+
+        parent_idx = self.link_names.index(parent_link_name)
+
+        # Get the number of spheres to attach
+        attach_batch_axes = spheres.get_batch_axes()
+        if len(attach_batch_axes) == 0:
+            # Single sphere
+            num_new_spheres = 1
+            spheres = spheres.broadcast_to((1,))
+        else:
+            num_new_spheres = attach_batch_axes[0]
+
+        # Check if the current collision geometry is Sphere-based
+        if not isinstance(self.coll, Sphere):
+            raise TypeError("attach_link only works with Sphere-based collision models")
+
+        # Get current collision data
+        coll_batch_axes = self.coll.get_batch_axes()
+        if len(coll_batch_axes) == 1:
+            raise ValueError(
+                "Cannot attach to simple collision model. Use from_urdf_spheres instead.")
+
+        num_links, num_spheres_per_link = coll_batch_axes
+
+        # Calculate new max spheres per link
+        new_max_spheres = max(num_new_spheres, num_spheres_per_link)
+
+        # Rebuild collision geometry with new link
+        new_sphere_list = []
+        new_num_spheres_per_link = list(self.num_spheres_per_link) if self.num_spheres_per_link else [
+            num_spheres_per_link] * num_links
+
+        # Add existing links with repadding if necessary
+        for i in range(num_links):
+            link_spheres = jax.tree.map(lambda x: x[i], self.coll)
+
+            if self.num_spheres_per_link:
+                valid_count = self.num_spheres_per_link[i]
+                center = link_spheres.pose.translation()[:valid_count]
+                radius = link_spheres.radius[:valid_count]
+            else:
+                center = link_spheres.pose.translation()
+                radius = link_spheres.radius
+
+            # Pad to new max
+            if center.shape[0] < new_max_spheres:
+                pad = new_max_spheres - center.shape[0]
+                center = jnp.concatenate(
+                    [center, jnp.zeros((pad, 3), dtype=center.dtype)], axis=0)
+                radius = jnp.concatenate(
+                    [radius, jnp.zeros((pad,), dtype=radius.dtype)], axis=0)
+
+            new_sphere_list.append(Sphere.from_center_and_radius(center, radius))
+
+        # Add new link
+        center = spheres.pose.translation()
+        radius = spheres.radius
+        if center.shape[0] < new_max_spheres:
+            pad = new_max_spheres - center.shape[0]
+            center = jnp.concatenate(
+                [center, jnp.zeros((pad, 3), dtype=center.dtype)], axis=0)
+            radius = jnp.concatenate(
+                [radius, jnp.zeros((pad,), dtype=radius.dtype)], axis=0)
+
+        new_sphere_list.append(Sphere.from_center_and_radius(center, radius))
+        new_num_spheres_per_link.append(num_new_spheres)
+
+        # Stack all spheres
+        new_coll = cast(Sphere, jax.tree.map(lambda *args: jnp.stack(args), *new_sphere_list))
+
+        # Update link names
+        new_link_names = self.link_names + (new_link_name,)
+        new_num_links = num_links + 1
+
+        # Update parent link indices
+        if self.parent_link_indices is None:
+            # Initialize with -1 for all original links (no parent tracking)
+            new_parent_indices = tuple([-1] * num_links + [parent_idx])
+        else:
+            new_parent_indices = self.parent_link_indices + (parent_idx,)
+
+        # Update active collision pairs
+        # Add all pairs with the new link (except parent if ignore_self_collision=True)
+        new_idx_i_list = list(self.active_idx_i)
+        new_idx_j_list = list(self.active_idx_j)
+
+        new_link_idx = new_num_links - 1
+        for i in range(num_links):
+            if ignore_self_collision and i == parent_idx:
+                continue  # Skip parent-child collision
+            # Add pair (i, new_link_idx) where i < new_link_idx
+            new_idx_i_list.append(i)
+            new_idx_j_list.append(new_link_idx)
+
+        new_active_idx_i = jnp.array(new_idx_i_list, dtype=jnp.int32)
+        new_active_idx_j = jnp.array(new_idx_j_list, dtype=jnp.int32)
+
+        return RobotCollision(
+            num_links=new_num_links,
+            link_names=new_link_names,
+            active_idx_i=new_active_idx_i,
+            active_idx_j=new_active_idx_j,
+            coll=new_coll,
+            num_spheres_per_link=tuple(new_num_spheres_per_link),
+            parent_link_indices=new_parent_indices,
+        )
+
+    def detach_link(
+        self,
+        link_name: str,
+    ) -> "RobotCollision":
+        """
+        Detach (remove) a link from the collision model.
+
+        Args:
+            link_name: Name of the link to remove.
+
+        Returns:
+            New RobotCollision instance without the detached link.
+        """
+        if link_name not in self.link_names:
+            raise ValueError(f"Link '{link_name}' not found in robot collision model")
+
+        link_idx = self.link_names.index(link_name)
+
+        # Check if the current collision geometry is Sphere-based
+        if not isinstance(self.coll, Sphere):
+            raise TypeError("detach_link only works with Sphere-based collision models")
+
+        if self.num_spheres_per_link is None:
+            raise ValueError("Cannot detach from model without sphere count tracking")
+
+        # Get current collision data
+        coll_batch_axes = self.coll.get_batch_axes()
+        if len(coll_batch_axes) == 1:
+            raise ValueError(
+                "Cannot detach from simple collision model. Use from_urdf_spheres instead.")
+
+        num_links, num_spheres_per_link = coll_batch_axes
+
+        # Rebuild collision geometry without the target link
+        new_sphere_list = []
+        new_num_spheres_per_link = []
+        new_link_names_list = []
+        new_parent_indices_list = []
+
+        # Create index mapping: old_idx -> new_idx
+        idx_mapping = {}
+        new_idx = 0
+        for i in range(num_links):
+            if i == link_idx:
+                continue  # Skip the link to remove
+
+            idx_mapping[i] = new_idx
+            new_idx += 1
+
+            # Extract and keep this link's spheres
+            link_spheres = jax.tree.map(lambda x: x[i], self.coll)
+            valid_count = self.num_spheres_per_link[i]
+            center = link_spheres.pose.translation()[:valid_count]
+            radius = link_spheres.radius[:valid_count]
+
+            # Pad to current max
+            if center.shape[0] < num_spheres_per_link:
+                pad = num_spheres_per_link - center.shape[0]
+                center = jnp.concatenate(
+                    [center, jnp.zeros((pad, 3), dtype=center.dtype)], axis=0)
+                radius = jnp.concatenate(
+                    [radius, jnp.zeros((pad,), dtype=radius.dtype)], axis=0)
+
+            new_sphere_list.append(Sphere.from_center_and_radius(center, radius))
+            new_num_spheres_per_link.append(self.num_spheres_per_link[i])
+            new_link_names_list.append(self.link_names[i])
+
+            if self.parent_link_indices:
+                old_parent = self.parent_link_indices[i]
+                if old_parent == -1 or old_parent == link_idx:
+                    new_parent_indices_list.append(-1)
+                else:
+                    new_parent_indices_list.append(idx_mapping.get(old_parent, -1))
+
+        if not new_sphere_list:
+            raise ValueError("Cannot remove all links from collision model")
+
+        # Stack all remaining spheres
+        new_coll = cast(Sphere, jax.tree.map(lambda *args: jnp.stack(args), *new_sphere_list))
+
+        # Update active collision pairs
+        new_idx_i_list = []
+        new_idx_j_list = []
+
+        for i, j in zip(self.active_idx_i, self.active_idx_j):
+            if i == link_idx or j == link_idx:
+                continue  # Skip pairs involving the removed link
+
+            new_i = idx_mapping[int(i)]
+            new_j = idx_mapping[int(j)]
+            new_idx_i_list.append(new_i)
+            new_idx_j_list.append(new_j)
+
+        new_active_idx_i = jnp.array(new_idx_i_list, dtype=jnp.int32)
+        new_active_idx_j = jnp.array(new_idx_j_list, dtype=jnp.int32)
+
+        return RobotCollision(
+            num_links=len(new_link_names_list),
+            link_names=tuple(new_link_names_list),
+            active_idx_i=new_active_idx_i,
+            active_idx_j=new_active_idx_j,
+            coll=new_coll,
+            num_spheres_per_link=tuple(new_num_spheres_per_link),
+            parent_link_indices=tuple(
+                new_parent_indices_list) if self.parent_link_indices else None,
+        )
+
     @staticmethod
     def from_urdf(
         urdf: yourdfpy.URDF,
@@ -385,6 +626,8 @@ class RobotCollision:
         Ensures that the link transforms returned by forward kinematics are applied
         to the corresponding collision geometries stored in this object, based on link names.
 
+        For attached links (with parent_link_indices), uses the parent link's transformation.
+
         Args:
             robot: The Robot instance containing kinematics information.
             cfg: The robot configuration (actuated joints).
@@ -393,16 +636,40 @@ class RobotCollision:
             The collision geometry (CollGeom) transformed to the world frame
             according to the provided configuration.
         """
-        # Check if the link names match - this should be true if both Robot
-        # and RobotCollision were created from the same URDF parser results.
-        assert self.link_names == robot.links.names, (
-            "Link name mismatch between RobotCollision and Robot kinematics."
-        )
-
+        # Get transforms for robot's kinematic links
         Ts_link_world_wxyz_xyz = robot.forward_kinematics(cfg)
-        Ts_link_world = jaxlie.SE3(Ts_link_world_wxyz_xyz)
+        Ts_robot_links = jaxlie.SE3(Ts_link_world_wxyz_xyz)
 
-        # Handle nested batch dimensions (e.g., multiple spheres per link)
+        # Build transform list for all collision links (including attached ones)
+        if self.parent_link_indices is not None and len(self.link_names) > len(robot.links.names):
+            # We have attached links - need to map them to their parent transforms
+            Ts_all_links_list = []
+
+            for i, link_name in enumerate(self.link_names):
+                if link_name in robot.links.names:
+                    # Original robot link - use FK result
+                    robot_link_idx = robot.links.names.index(link_name)
+                    # Extract individual SE3 from batched SE3
+                    T_link = jax.tree.map(lambda x: x[robot_link_idx], Ts_robot_links)
+                    Ts_all_links_list.append(T_link)
+                else:
+                    # Attached link - use parent link's transform
+                    parent_idx = self.parent_link_indices[i]
+                    if parent_idx >= 0:
+                        Ts_all_links_list.append(Ts_all_links_list[parent_idx])
+                    else:
+                        # No parent - use identity (shouldn't happen for attached links)
+                        Ts_all_links_list.append(jaxlie.SE3.identity())
+
+            # Stack into array
+            Ts_link_world = jax.tree.map(lambda *args: jnp.stack(args), *Ts_all_links_list)
+        else:
+            # No attached links - original behavior
+            assert self.link_names == robot.links.names, (
+                "Link name mismatch between RobotCollision and Robot kinematics."
+            )
+            # Handle nested batch dimensions (e.g., multiple spheres per link)
+            Ts_link_world = Ts_robot_links
         coll_batch_axes = self.coll.get_batch_axes()
         if len(coll_batch_axes) > 1:
             # Expand transform dimensions to match collision geometry
