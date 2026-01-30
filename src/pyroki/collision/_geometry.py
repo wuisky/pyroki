@@ -85,6 +85,11 @@ class CollGeom(abc.ABC):
         if not batch_axes:
             return self._create_one_mesh(tuple())
 
+        # Optimization: try batch creation for Sphere types
+        if isinstance(self, Sphere):
+            return self._create_batch_spheres()
+
+        # Fallback to sequential creation for other geometry types
         meshes = [
             self._create_one_mesh(idx_tuple) for idx_tuple in onp.ndindex(batch_axes)
         ]
@@ -182,6 +187,60 @@ class Sphere(CollGeom):
         tf[:3, 3] = pos
         sphere_mesh.apply_transform(tf)
         return sphere_mesh
+
+    def _create_batch_spheres(self) -> trimesh.Trimesh:
+        """Optimized batch creation of sphere meshes.
+
+        This method significantly speeds up mesh generation by:
+        1. Caching the template icosphere mesh
+        2. Vectorizing vertex transformations
+        3. Avoiding repeated trimesh.util.concatenate calls
+        """
+        batch_axes = self.get_batch_axes()
+        if not batch_axes:
+            return self._create_one_mesh(tuple())
+
+        # Get all positions and radii as numpy arrays
+        positions = onp.array(self.pose.translation())  # Shape: (*batch_axes, 3)
+        radii = onp.array(self.radius)  # Shape: (*batch_axes,)
+
+        # Flatten batch dimensions
+        positions_flat = positions.reshape(-1, 3)
+        radii_flat = radii.reshape(-1)
+        n_spheres = positions_flat.shape[0]
+
+        # Group spheres by radius to reuse template meshes
+        unique_radii = onp.unique(radii_flat)
+
+        # Cache template meshes for each unique radius
+        template_cache = {}
+        for r in unique_radii:
+            template_cache[r] = trimesh.creation.icosphere(radius=float(r), subdivisions=1)
+
+        # Build combined mesh by reusing templates
+        all_vertices = []
+        all_faces = []
+        vertex_offset = 0
+
+        for i in range(n_spheres):
+            r = radii_flat[i]
+            pos = positions_flat[i]
+            # Get cached template
+            template = template_cache[r]
+            # Transform vertices (just translation for spheres)
+            vertices = template.vertices + pos
+            faces = template.faces + vertex_offset
+            all_vertices.append(vertices)
+            all_faces.append(faces)
+            vertex_offset += len(vertices)
+
+        # Combine all meshes at once
+        if not all_vertices:
+            return trimesh.Trimesh()
+
+        combined_vertices = onp.vstack(all_vertices)
+        combined_faces = onp.vstack(all_faces)
+        return trimesh.Trimesh(vertices=combined_vertices, faces=combined_faces)
 
 
 @jdc.pytree_dataclass
