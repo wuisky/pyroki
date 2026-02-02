@@ -68,7 +68,7 @@ def _solve_online_planning_jax(
     prev_sols: jnp.ndarray,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     num_targets = len(target_links)  # 1
-    jax.debug.print("num_targets: {x}", x=target_links)
+    # jax.debug.print("num_targets: {x}", x=target_links)
 
     def batched_rplus(
         pose: jaxlie.SE3,
