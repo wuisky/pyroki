@@ -648,15 +648,15 @@ class RobotCollision:
                 num_spheres_per_link.append(s.get_batch_axes()[0])
         max_spheres = max(num_spheres_per_link)
 
-        # 各リンクの球をmax_spheres個に揃えてリスト化
-        sphere_list = []
+        # 各リンクの球のcenterとradiusをmax_spheres個に揃えてリスト化
+        center_list = []
+        radius_list = []
         for link_name in link_name_list:
             s = RobotCollision._get_sphere_collision_geometries(urdf, link_name)
             if s is None or s.get_batch_axes()[0] == 0:
                 # ダミー
                 center = jnp.zeros((max_spheres, 3), dtype=jnp.float32)
                 radius = jnp.zeros((max_spheres,), dtype=jnp.float32)
-                s = Sphere.from_center_and_radius(center, radius)
             else:
                 # パディング
                 n = s.get_batch_axes()[0]
@@ -666,10 +666,16 @@ class RobotCollision:
                         (pad, 3), dtype=s.pose.translation().dtype)], axis=0)
                     radius = jnp.concatenate(
                         [s.radius, jnp.zeros((pad,), dtype=s.radius.dtype)], axis=0)
-                    s = Sphere.from_center_and_radius(center, radius)
-            sphere_list.append(s)
+                else:
+                    center = s.pose.translation()
+                    radius = s.radius
+            center_list.append(center)
+            radius_list.append(radius)
 
-        spheres = cast(Sphere, jax.tree.map(lambda *args: jnp.stack(args), *sphere_list))
+        # 全リンクの球を一度に作成
+        all_centers = jnp.stack(center_list, axis=0)  # Shape: (num_links, max_spheres, 3)
+        all_radii = jnp.stack(radius_list, axis=0)    # Shape: (num_links, max_spheres)
+        spheres = Sphere.from_center_and_radius(all_centers, all_radii)
 
         # Directly compute active pair indices
         active_idx_i, active_idx_j = RobotCollision._compute_active_pair_indices(
