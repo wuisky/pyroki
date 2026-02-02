@@ -19,6 +19,10 @@ from wutility import sample_even_fit_mesh, voxel_fit_volume_sample_surface_mesh
 import pyroki as pk
 from pyroki.collision import Capsule, HalfSpace, RobotCollision, Sphere
 
+# Constants
+NUM_OBJECT_SPHERES = 100
+NUM_HAND_SPHERES = 100
+
 
 def display_link_frames(
     server: viser.ViserServer,
@@ -193,7 +197,8 @@ def main():
     hand_mesh = trimesh.load_mesh(
         str(Path(__file__).parent / '../cad/robotiq_2F_adaptive_gripper_rough.STL'))
     hand_mesh.apply_scale(0.001)
-    sphere_hand_mesh = spherelize_mesh(hand_mesh, n_spheres=100, sphere_radius=0.002)
+    sphere_hand_mesh = spherelize_mesh(
+        hand_mesh, n_spheres=NUM_HAND_SPHERES, sphere_radius=0.002)
 
     offset = jaxlie.SE3.from_rotation_and_translation(
         rotation=jaxlie.SO3.identity(),
@@ -211,9 +216,9 @@ def main():
     print(f'After attaching hand: {robot_coll.num_spheres_per_link=}')
     print(f'After attaching hand: {robot_coll.parent_link_indices=}')
 
-    # Create 100 spheres with radius 0 at origin
-    dummy_centers = np.zeros((100, 3))  # All at [0, 0, 0]
-    dummy_radii = np.zeros(100)  # All radius = 0
+    # Create dummy spheres with radius 0 at origin
+    dummy_centers = np.zeros((NUM_OBJECT_SPHERES, 3))  # All at [0, 0, 0]
+    dummy_radii = np.zeros(NUM_OBJECT_SPHERES)  # All radius = 0
     dummy_obj = Sphere.from_center_and_radius(dummy_centers, dummy_radii)
 
     robot_coll = robot_coll.attach_link(
@@ -227,27 +232,28 @@ def main():
     obj_mesh = trimesh.load_mesh(
         str(Path(__file__).parent / '../cad/Bunny.stl'))
     obj_mesh.apply_scale(0.001)
-    obj_spheres_raw = spherelize_mesh(obj_mesh, n_spheres=100, sphere_radius=0.002)
+    obj_spheres_raw = spherelize_mesh(
+        obj_mesh, n_spheres=NUM_OBJECT_SPHERES, sphere_radius=0.002)
 
     server.scene.add_mesh_trimesh(
         "/bunny", mesh=obj_mesh, position=(0, 1, 0))
 
-    # Ensure exactly 100 spheres by padding if necessary
+    # Ensure exactly NUM_OBJECT_SPHERES spheres by padding if necessary
     obj_centers = obj_spheres_raw.pose.translation()
     obj_radii = obj_spheres_raw.radius
     num_obj_spheres = obj_centers.shape[0]
 
-    if num_obj_spheres < 100:
-        # Pad to 100 spheres with zero radius
-        pad = 100 - num_obj_spheres
+    if num_obj_spheres < NUM_OBJECT_SPHERES:
+        # Pad to NUM_OBJECT_SPHERES spheres with zero radius
+        pad = NUM_OBJECT_SPHERES - num_obj_spheres
         obj_centers = jnp.concatenate(
             [obj_centers, jnp.zeros((pad, 3), dtype=obj_centers.dtype)], axis=0)
         obj_radii = jnp.concatenate(
             [obj_radii, jnp.zeros((pad,), dtype=obj_radii.dtype)], axis=0)
-    elif num_obj_spheres > 100:
-        # Truncate to 100 spheres
-        obj_centers = obj_centers[:100]
-        obj_radii = obj_radii[:100]
+    elif num_obj_spheres > NUM_OBJECT_SPHERES:
+        # Truncate to NUM_OBJECT_SPHERES spheres
+        obj_centers = obj_centers[:NUM_OBJECT_SPHERES]
+        obj_radii = obj_radii[:NUM_OBJECT_SPHERES]
 
     obj_spheres = Sphere.from_center_and_radius(obj_centers, obj_radii)
     print(f'Object spheres: {obj_spheres.get_batch_axes()[0]} spheres')
@@ -302,8 +308,8 @@ def main():
     def _(_) -> None:
         nonlocal robot_coll
         # Reset 'object' link spheres to zero radius (invisible)
-        dummy_centers = np.zeros((100, 3))
-        dummy_radii = np.zeros(100)
+        dummy_centers = np.zeros((NUM_OBJECT_SPHERES, 3))
+        dummy_radii = np.zeros(NUM_OBJECT_SPHERES)
         dummy_obj = Sphere.from_center_and_radius(dummy_centers, dummy_radii)
         robot_coll = robot_coll.update_link_spheres(
             link_name='object',
