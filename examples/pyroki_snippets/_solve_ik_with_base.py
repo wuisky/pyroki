@@ -3,9 +3,7 @@ import jax.numpy as jnp
 import jax_dataclasses as jdc
 import jaxlie
 import jaxls
-
 import numpy as onp
-
 import pyroki as pk
 
 
@@ -22,6 +20,7 @@ def solve_ik_with_base(
 ) -> tuple[onp.ndarray, onp.ndarray, onp.ndarray]:
     """
     Solves the basic IK problem for a robot with a mobile base.
+    Weights are tuned for the Fetch mobile robot.
 
     Args:
         robot: PyRoKi Robot.
@@ -92,7 +91,8 @@ def _solve_ik_jax(
 
     base_var = ConstrainedSE3Var(0)
 
-    factors = [
+    variables = [joint_var, base_var]
+    costs = [
         pk.costs.pose_cost_with_base(
             robot,
             joint_var,
@@ -102,24 +102,27 @@ def _solve_ik_jax(
             pos_weight=jnp.array(5.0),
             ori_weight=jnp.array(1.0),
         ),
-        pk.costs.limit_cost(
-            robot,
-            joint_var,
-            jnp.array(100.0),
-        ),
         pk.costs.rest_with_base_cost(
             joint_var,
             base_var,
-            jnp.array(joint_var.default_factory()),
+            jnp.array(prev_cfg),
             jnp.array(
-                [0.01] * robot.joints.num_actuated_joints
-                + [0.1] * 3  # Base position DoF.
-                + [0.001] * 3,  # Base orientation DoF.
+                [0.1] * 2
+                + [2.0]  # fetch torso_lift is at index 2; regularize it like base DoF.
+                + [0.1] * (robot.joints.num_actuated_joints - 3)
+                + [2.0] * 3  # Base position DoF.
+                + [0.5] * 3,  # Base orientation DoF.
             ),
         ),
     ]
+    costs.append(
+        pk.costs.limit_constraint(
+            robot,
+            joint_var,
+        ),
+    )
     sol = (
-        jaxls.LeastSquaresProblem(factors, [joint_var, base_var])
+        jaxls.LeastSquaresProblem(costs=costs, variables=variables)
         .analyze()
         .solve(
             initial_vals=jaxls.VarValues.make(

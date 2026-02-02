@@ -57,9 +57,13 @@ class CollGeom(abc.ABC):
 
     def transform(self, transform: jaxlie.SE3) -> Self:
         """Left-multiples geometry's pose with an SE(3) transformation."""
-        with jdc.copy_and_mutate(self) as out:
-            out.pose = transform @ self.pose
-        return out.broadcast_to(out.pose.get_batch_axes())
+        broadcasted_axes = jnp.broadcast_shapes(
+            self.pose.get_batch_axes(), transform.get_batch_axes()
+        )
+        _self = self.broadcast_to(broadcasted_axes)
+        with jdc.copy_and_mutate(_self) as out:
+            out.pose = transform @ _self.pose
+        return out
 
     def transform_from_wxyz_position(
         self,
@@ -345,6 +349,93 @@ class Capsule(CollGeom):
 
         assert capsule.get_batch_axes() == sph_0.get_batch_axes()
         return capsule
+
+
+@jdc.pytree_dataclass
+class Box(CollGeom):
+    """Box geometry defined by half-extents."""
+
+    @property
+    def half_extent(self) -> Float[Array, "*batch 3"]:
+        """Half-extents (half width, half height, half depth) in local frame."""
+        return self.size
+
+    @property
+    def extent(self) -> Float[Array, "*batch 3"]:
+        """Full extents (width, height, depth) in local frame."""
+        return self.size * 2
+
+    @staticmethod
+    def from_extent(
+        extent: Float[ArrayLike, "*batch 3"],
+        position: Float[ArrayLike, "*batch 3"] | None = None,
+        wxyz: Float[ArrayLike, "*batch 4"] | None = None,
+    ) -> "Box":
+        """Create Box from full extents (width, height, depth)."""
+        if position is None:
+            position = jnp.zeros((3,))
+        if wxyz is None:
+            wxyz = jnp.array([1.0, 0.0, 0.0, 0.0])
+
+        extent = jnp.array(extent)
+        position = jnp.array(position)
+        wxyz = jnp.array(wxyz)
+
+        batch_axes = jnp.broadcast_shapes(
+            extent.shape[:-1], position.shape[:-1], wxyz.shape[:-1]
+        )
+        extent = jnp.broadcast_to(extent, batch_axes + (3,))
+        position = jnp.broadcast_to(position, batch_axes + (3,))
+        wxyz = jnp.broadcast_to(wxyz, batch_axes + (4,))
+
+        wxyz_xyz = jnp.concatenate([wxyz, position], axis=-1)
+        pose = jaxlie.SE3(wxyz_xyz)
+
+        # Store half-extents in size
+        size = extent / 2.0
+        return Box(pose=pose, size=size)
+
+    def get_corners_local(self) -> Float[Array, "*batch 8 3"]:
+        """Get the 8 corners of the box in local frame."""
+        half = self.half_extent
+
+        # 8 corners from all combinations of +/- half extents
+        signs = jnp.array(
+            [
+                [-1, -1, -1],
+                [-1, -1, +1],
+                [-1, +1, -1],
+                [-1, +1, +1],
+                [+1, -1, -1],
+                [+1, -1, +1],
+                [+1, +1, -1],
+                [+1, +1, +1],
+            ]
+        )  # (8, 3)
+
+        # Broadcast: half is (*batch, 3), signs is (8, 3)
+        # Result: (*batch, 8, 3)
+        corners = half[..., None, :] * signs
+        return corners
+
+    def get_corners_world(self) -> Float[Array, "*batch 8 3"]:
+        """Get the 8 corners of the box in world frame."""
+        corners_local = self.get_corners_local()  # (*batch, 8, 3)
+        # Apply pose to each corner
+        return self.pose.apply(corners_local)
+
+    def _create_one_mesh(self, index: tuple) -> trimesh.Trimesh:
+        pose_i: jaxlie.SE3 = jax.tree.map(lambda x: x[index], self.pose)
+        pos = onp.array(pose_i.translation())
+        mat = onp.array(pose_i.rotation().as_matrix())
+        extent_val = onp.array(self.extent[index])
+
+        box_mesh = trimesh.creation.box(extents=extent_val)
+        tf = onp.eye(4)
+        tf[:3, :3] = mat
+        tf[:3, 3] = pos
+        box_mesh.apply_transform(tf)
+        return box_mesh
 
 
 @jdc.pytree_dataclass

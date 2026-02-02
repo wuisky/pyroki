@@ -4,12 +4,10 @@ Shadow Hand retargeting example, with costs to maintain contact with the object.
 Find and unzip the shadowhand URDF at `assets/hand_retargeting/shadowhand_urdf.zip`.
 """
 
-import time
-from typing import Tuple, TypedDict
-from pathlib import Path
 import pickle
-import trimesh
-from scipy.spatial.transform import Rotation as R
+import time
+from pathlib import Path
+from typing import Tuple, TypedDict
 
 import jax
 import jax.numpy as jnp
@@ -17,16 +15,17 @@ import jax_dataclasses as jdc
 import jaxlie
 import jaxls
 import numpy as onp
-import viser
-from viser.extras import ViserUrdf
-import yourdfpy
-
 import pyroki as pk
+import trimesh
+import viser
+import yourdfpy
+from scipy.spatial.transform import Rotation as R
+from viser.extras import ViserUrdf
 
 from retarget_helpers._utils import (
+    MANO_TO_SHADOW_MAPPING,
     create_conn_tree,
     get_mapping_from_mano_to_shadow,
-    MANO_TO_SHADOW_MAPPING,
 )
 
 
@@ -232,10 +231,10 @@ def solve_retargeting(
     var_smpl_joints_scale = ManoJointsScaleVar(jnp.zeros(timesteps))
     var_offset = OffsetVar(jnp.zeros(timesteps))
 
-    # Costs.
+    # Costs and constraints.
     costs: list[jaxls.Cost] = []
 
-    @jaxls.Cost.create_factory
+    @jaxls.Cost.factory
     def retargeting_cost(
         var_values: jaxls.VarValues,
         var_Ts_world_root: jaxls.SE3Var,
@@ -297,7 +296,7 @@ def solve_retargeting(
         )
         return residual
 
-    @jaxls.Cost.create_factory
+    @jaxls.Cost.factory
     def scale_regularization(
         var_values: jaxls.VarValues,
         var_smpl_joints_scale: ManoJointsScaleVar,
@@ -313,7 +312,7 @@ def solve_retargeting(
         res_2 = jnp.clip(-var_values[var_smpl_joints_scale], min=0).flatten() * 100.0
         return jnp.concatenate([res_0, res_1, res_2])
 
-    @jaxls.Cost.create_factory
+    @jaxls.Cost.factory
     def pc_alignment_cost(
         var_values: jaxls.VarValues,
         var_Ts_world_root: jaxls.SE3Var,
@@ -329,7 +328,7 @@ def solve_retargeting(
         keypoint_pos = keypoints[mano_joint_retarget_indices]
         return (link_pos - keypoint_pos).flatten() * weights["global_alignment"]
 
-    @jaxls.Cost.create_factory
+    @jaxls.Cost.factory
     def root_smoothness(
         var_values: jaxls.VarValues,
         var_Ts_world_root: jaxls.SE3Var,
@@ -341,7 +340,7 @@ def solve_retargeting(
             - var_values[var_Ts_world_root_prev].translation()
         ).flatten() * weights["root_smoothness"]
 
-    @jaxls.Cost.create_factory
+    @jaxls.Cost.factory
     def contact_cost(
         var_values: jaxls.VarValues,
         var_T_world_root: jaxls.SE3Var,
@@ -387,11 +386,6 @@ def solve_retargeting(
             target_keypoints,
         ),
         scale_regularization(var_smpl_joints_scale),
-        pk.costs.limit_cost(
-            jax.tree.map(lambda x: x[None], robot),
-            var_joints,
-            100.0,
-        ),
         pk.costs.smoothness_cost(
             robot.joint_var_cls(jnp.arange(1, timesteps)),
             robot.joint_var_cls(jnp.arange(0, timesteps - 1)),
@@ -421,9 +415,22 @@ def solve_retargeting(
         ),
     ]
 
+    costs.append(
+        pk.costs.limit_constraint(
+            jax.tree.map(lambda x: x[None], robot),
+            var_joints,
+        ),
+    )
+
     solution = (
         jaxls.LeastSquaresProblem(
-            costs, [var_joints, var_Ts_world_root, var_smpl_joints_scale, var_offset]
+            costs=costs,
+            variables=[
+                var_joints,
+                var_Ts_world_root,
+                var_smpl_joints_scale,
+                var_offset,
+            ],
         )
         .analyze()
         .solve()
