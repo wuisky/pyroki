@@ -25,7 +25,7 @@ dependencies = [
     "jaxtyping",
     "loguru",
     "robot_descriptions",
-    "jaxls @ git+https://github.com/brentyi/jaxls.git",
+    "jaxls",
     "yourdfpy",
     "trimesh",
     "viser",
@@ -69,3 +69,6 @@ ignore = [
     "PLW0603",  # Globa statement updates are discouraged.
     "PLW2901",  # For loop variable overwritten.
 ]
+
+[tool.uv.sources]
+jaxls = { git = "https://github.com/brentyi/jaxls.git", rev = "main" }
