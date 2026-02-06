@@ -1,3 +1,4 @@
+from ._wuonline_planning import solve_online_planning as wu_solve_online_planning
 from ._online_planning import solve_online_planning as solve_online_planning
 from ._solve_ik import solve_ik as solve_ik
 from ._solve_ik_with_base import solve_ik_with_base as solve_ik_with_base
