@@ -1,0 +1,667 @@
+"""Online Planning
+
+Run online planning in collision aware environments.
+"""
+
+import jax
+from wutility import voxel_fit_volume_sample_surface_mesh
+from wutility import sample_even_fit_mesh
+from viser.extras import ViserUrdf
+import viser
+import trimesh
+from robot_descriptions.loaders.yourdfpy import yourdfpy
+from robot_descriptions.loaders.yourdfpy import load_robot_description
+import pyroki_snippets as pks
+from pyroki.collision import Sphere
+from pyroki.collision import RobotCollision
+from pyroki.collision import HalfSpace
+import pyroki as pk
+import numpy as np
+import json
+import os
+from pathlib import Path
+import time
+
+import toppra as ta
+import toppra.constraint as constraint
+import toppra.algorithm as algo
+
+import rclpy
+from builtin_interfaces.msg import Duration
+from rclpy.duration import Duration as rclDuration
+from control_msgs.action import FollowJointTrajectory
+from rclpy.action import ActionClient
+from rclpy.node import Node
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+from rclpy.qos import (DurabilityPolicy, QoSProfile, ReliabilityPolicy,
+                       HistoryPolicy)
+
+# # Enable JAX persistent compilation cache
+# # Use a permanent directory (not /tmp which is cleared on reboot)
+# os.environ["JAX_COMPILATION_CACHE_DIR"] = str(Path.home() / ".cache" / "jax")
+# os.environ["JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES"] = "-1"
+# os.environ["JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS"] = "0"
+
+
+# # Enable JAX persistent compilation cache
+# os.environ["JAX_COMPILATION_CACHE_DIR"] = "/tmp/jax_cache"
+# # JAX 0.7+ uses different config names
+# jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
+# jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+# jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+
+
+class PublisherJointTrajectory(Node):
+
+    def __init__(self):
+        super().__init__("publisher_position_trajectory_controller")
+        action_name = '/joint_trajectory_controller/follow_joint_trajectory'
+        self.action_client = ActionClient(self, FollowJointTrajectory, action_name)
+        qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.publisher = self.create_publisher(JointTrajectory,
+                                               "/joint_trajectory_controller/joint_trajectory",
+                                               qos)
+
+    def goal_response_callback(self, future):
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.get_logger().info('Goal rejected :(')
+            return
+
+        self.get_logger().info('Goal accepted :)')
+
+        self.get_result_future = goal_handle.get_result_async()
+        self.get_result_future.add_done_callback(self.get_result_callback)
+
+    def get_result_callback(self, future):
+        error_string = future.result().result.error_string
+        error_code = future.result().result.error_code
+        if error_code == FollowJointTrajectory.Result.SUCCESSFUL:
+            self.get_logger().info('Goal succeeded!')
+        else:
+            self.get_logger().info(f'Goal failed with error string: {error_string}')
+
+    def send_topic(self, joint_list):
+        traj = JointTrajectory()
+        # traj.joint_names = self.joints
+        traj.joint_names = [
+            'shoulder_pan_joint', 'shoulder_lift_joint', 'elbow_joint',
+            'wrist_1_joint', 'wrist_2_joint', 'wrist_3_joint'
+        ]
+        # traj.points.append(self.goals[0])
+        point = JointTrajectoryPoint()
+        point.positions = joint_list
+        point.velocities = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        point.time_from_start = Duration(sec=4)
+        traj.points.append(point)
+        # traj.header.stamp = rclpy.ti
+        traj.header.frame_id = 'base'
+        self.publisher.publish(traj)
+
+    def send_joint_trajectory(self, ts_sample, qs_sample, qds_sample, qdds_sample, current_cfg):
+        traj = JointTrajectory()
+        traj.joint_names = [
+            'shoulder_pan_joint', 'shoulder_lift_joint', 'elbow_joint',
+            'wrist_1_joint', 'wrist_2_joint', 'wrist_3_joint'
+        ]
+
+        # # Add current position as the first point (time_from_start = 0)
+        # start_point = JointTrajectoryPoint()
+        # start_point.positions = list(current_cfg)
+        # start_point.velocities = [0.0] * len(current_cfg)
+        # start_point.accelerations = [0.0] * len(current_cfg)
+        # start_point.time_from_start = rclDuration(seconds=0.0).to_msg()
+        # traj.points.append(start_point)
+
+        # Add trajectory points with offset time
+        for t, q, dq, ddq in zip(ts_sample, qs_sample, qds_sample, qdds_sample):
+            point = JointTrajectoryPoint()
+            point.positions = list(q)
+            point.velocities = list(dq)
+            point.accelerations = list(ddq)
+            point.time_from_start = rclDuration(seconds=t).to_msg()
+            traj.points.append(point)
+
+        # traj.header.frame_id = 'base'
+        self.publisher.publish(traj)
+
+
+def create_robot_control_sliders(
+    server: viser.ViserServer, viser_urdf: ViserUrdf
+) -> tuple[list[viser.GuiInputHandle[float]], list[float]]:
+    """Create slider for each joint of the robot. We also update robot model
+    when slider moves."""
+    slider_handles: list[viser.GuiInputHandle[float]] = []
+    initial_config: list[float] = []
+    for joint_name, (
+        lower,
+        upper,
+    ) in viser_urdf.get_actuated_joint_limits().items():
+        lower = lower if lower is not None else -np.pi
+        upper = upper if upper is not None else np.pi
+        initial_pos = 0.0 if lower < -0.1 and upper > 0.1 else (lower + upper) / 2.0
+        slider = server.gui.add_slider(
+            label=joint_name,
+            min=lower,
+            max=upper,
+            step=1e-3,
+            initial_value=initial_pos,
+        )
+        # slider.on_update(  # When sliders move, we update the URDF configuration.
+        #     lambda _: viser_urdf.update_cfg(
+        #         np.array([slider.value for slider in slider_handles])
+        #     )
+        # )
+        slider_handles.append(slider)
+        initial_config.append(initial_pos)
+    return slider_handles, initial_config
+
+
+def update_robot_visualization(
+    urdf_vis: ViserUrdf,
+    slider_handles: list[viser.GuiInputHandle[float]],
+    robot: pk.Robot,
+    robot_coll: RobotCollision,
+    server: viser.ViserServer,
+    config: np.ndarray,
+) -> None:
+    """Update robot URDF visualization, sliders, and collision mesh."""
+    urdf_vis.update_cfg(config)
+    for slider, value in zip(slider_handles, config):
+        slider.value = float(value)
+    robot_coll_mesh = robot_coll.at_config(robot, config).to_trimesh()
+    server.scene.add_mesh_trimesh("/robot_coll", mesh=robot_coll_mesh, visible=False)
+
+
+def time_parameterize_toppra(
+    waypoints: np.ndarray,
+    max_velocity: float = 3.14,  # rad/s
+    max_acceleration: float = 800.0 * np.pi / 180.0,  # 800 deg/s^2 -> rad/s^2
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Time parameterization using TOPPRA with quintic spline interpolation.
+
+    Args:
+        waypoints: (N, n_dof) array of joint configurations
+        max_velocity: Maximum joint velocity [rad/s]
+        max_acceleration: Maximum joint acceleration [rad/s^2]
+
+    Returns:
+        ts_sample: Time points for interpolated trajectory
+        qs_sample: Joint positions at sample points
+        qds_sample: Joint velocities at sample points
+        qdds_sample: Joint accelerations at sample points
+    """
+
+    n_waypoints, n_dof = waypoints.shape
+
+    # Create path parameter (0 to 1)
+    # Use arbitrary spacing - TOPPRA will optimize time intervals
+    ss = np.linspace(0, 1, n_waypoints)
+
+    # Create quintic spline path with zero velocity/acceleration at endpoints
+    path = ta.SplineInterpolator(ss, waypoints, bc_type='clamped')
+
+    # Create velocity and acceleration constraints
+    # Stack lower and upper bounds as (n_dof, 2) array
+    vlim = np.stack([
+        np.full(n_dof, -max_velocity),
+        np.full(n_dof, max_velocity)
+    ], axis=1)  # shape (n_dof, 2)
+    alim = np.stack([
+        np.full(n_dof, -max_acceleration),
+        np.full(n_dof, max_acceleration)
+    ], axis=1)  # shape (n_dof, 2)
+
+    pc_vel = constraint.JointVelocityConstraint(vlim)
+    pc_acc = constraint.JointAccelerationConstraint(alim)
+
+    # Setup and solve optimization problem
+    instance = algo.TOPPRA(
+        [pc_vel, pc_acc],
+        path,
+        solver_wrapper='seidel',
+    )
+
+    jnt_traj = instance.compute_trajectory()
+
+    if jnt_traj is None:
+        print("TOPPRA failed to find solution, using original waypoints")
+        # Return simple linear interpolation as fallback
+        ts_sample = np.linspace(0, (n_waypoints - 1) * 0.1, n_waypoints)
+        qs_sample = waypoints
+        qds_sample = np.zeros_like(waypoints)
+        qdds_sample = np.zeros_like(waypoints)
+        return ts_sample, qs_sample, qds_sample, qdds_sample
+
+    # Sample the time-parameterized trajectory
+    duration = jnt_traj.duration
+    ts_sample = np.linspace(0, duration, int(duration / 0.1))  # 10 Hz sampling
+    qs_sample = jnt_traj(ts_sample)
+    qds_sample = jnt_traj(ts_sample, 1)  # First derivative
+    qdds_sample = jnt_traj(ts_sample, 2)  # Second derivative
+
+    print(f"TOPPRA: Original {n_waypoints} waypoints -> {len(ts_sample)} samples")
+    print(f"Total duration: {duration:.3f}s")
+    print(f"Max velocity: {np.max(np.abs(qds_sample)):.3f} rad/s")
+    print(f"Max acceleration: {np.max(np.abs(qdds_sample)):.3f} rad/s^2")
+
+    return ts_sample, qs_sample, qds_sample, qdds_sample
+
+
+def main():
+    rclpy.init()
+    node = PublisherJointTrajectory()
+    node.send_topic([-0.523, -1.61, 1.544, -1.5, -1.57, -0.5])
+    """Main function for online planning with collision."""
+    # urdf = load_robot_description("panda_description")
+    # target_link_name = "panda_hand"
+    # robot = pk.Robot.from_urdf(urdf)
+    # robot_coll = RobotCollision.from_urdf(urdf)
+    # urdf = load_robot_description("ur5_description")
+    # target_link_name = "ee_link"
+    urdf_path = str(Path(__file__).parent / '../ur5e/ur5e.urdf.sphere')
+    target_link_name = 'tool0'
+    urdf = yourdfpy.URDF.load(urdf_path)
+    sphere_json_path = Path(__file__).parent / "../ur5e/ur5e_spheres.json"
+    with open(sphere_json_path, "r") as f:
+        sphere_decomposition = json.load(f)
+    robot_coll = pk.collision.RobotCollision.from_sphere_decomposition(
+        sphere_decomposition=sphere_decomposition,
+        urdf=urdf,
+    )
+    # For UR5 it's important to initialize the robot in a safe configuration;
+    # the zero-configuration puts the robot aligned with the wall obstacle.
+    # default_cfg = np.array([0, -1.57, 0, -1.57, 0, 0])
+    default_cfg = np.array([-0.523, -1.61, 1.544, -1.5, -1.57, -0.5])
+    robot = pk.Robot.from_urdf(urdf, default_joint_cfg=default_cfg)
+
+    plane_coll = HalfSpace.from_point_and_normal(
+        np.array([0.0, 0.0, 0.0]), np.array([0.0, 0.0, 1.0])
+    )
+    sphere_coll = Sphere.from_center_and_radius(
+        np.array([0.0, 0.0, 0.0]), np.array([0.05])
+    )
+
+    # Define the online planning parameters.
+    len_traj, dt = 10, 0.1
+
+    # Set up visualizer.
+    server = viser.ViserServer()
+    server.scene.add_grid("/ground", width=2, height=2, cell_size=0.1)
+    server.gui.configure_theme(dark_mode=True)
+    urdf_vis = ViserUrdf(server, urdf, root_node_name="/robot")
+    with server.gui.add_folder("Joint   position"):
+        (slider_handles, initial_config) = create_robot_control_sliders(
+            server, urdf_vis
+        )
+
+    # Create interactive controller for IK target.
+    ik_target_handle = server.scene.add_transform_controls(
+        "/ik_target", scale=0.2,
+        # position=(0.3, 0.0, 0.5), wxyz=(0, 0, 1, 0)
+        position=(0.3398, -0.12158905, 0.5132406), wxyz=(0, 0.707, -0.707, 0)
+    )
+
+    # Create interactive controller and mesh for the sphere obstacle.
+    sphere_handle = server.scene.add_transform_controls(
+        "/obstacle", scale=0.2, position=(0.4, 0.3, 0.4)
+    )
+    server.scene.add_mesh_trimesh("/obstacle/mesh", mesh=sphere_coll.to_trimesh())
+    target_frame_handle = server.scene.add_batched_axes(
+        "target_frame",
+        axes_length=0.05,
+        axes_radius=0.005,
+        batched_positions=np.zeros((25, 3)),
+        batched_wxyzs=np.array([[1.0, 0.0, 0.0, 0.0]] * 25),
+    )
+
+    # Create weight sliders for cost functions
+    with server.gui.add_folder("Cost Weights"):
+        with server.gui.add_folder("Pose Costs"):
+            weight_pose_match_rotation = server.gui.add_slider(
+                label="Pose Match Rotation",
+                min=0.0,
+                max=200.0,
+                step=1.0,
+                initial_value=100.0,
+            )
+            weight_pose_match_translation = server.gui.add_slider(
+                label="Pose Match Translation",
+                min=0.0,
+                max=400.0,
+                step=1.0,
+                initial_value=100.0,
+            )
+            weight_pose_smoothness = server.gui.add_slider(
+                label="Pose Smoothness",
+                min=0.0,
+                max=10.0,
+                step=0.1,
+                initial_value=3.0,
+            )
+            weight_match_start_pose = server.gui.add_slider(
+                label="Match Start Pose",
+                min=0.0,
+                max=200.0,
+                step=1.0,
+                initial_value=100.0,
+            )
+            weight_match_joint_to_pose = server.gui.add_slider(
+                label="Match Joint to Pose",
+                min=0.0,
+                max=200.0,
+                step=1.0,
+                initial_value=100.0,
+            )
+
+        with server.gui.add_folder("Joint Costs"):
+            weight_smoothness = server.gui.add_slider(
+                label="Smoothness",
+                min=0.0,
+                max=50.0,
+                step=1.0,
+                initial_value=1.0,
+            )
+            weight_limit_velocity = server.gui.add_slider(
+                label="Limit Velocity",
+                min=0.0,
+                max=10.0,
+                step=0.1,
+                initial_value=1.0,
+            )
+            weight_limit = server.gui.add_slider(
+                label="Joint Limit",
+                min=0.0,
+                max=200.0,
+                step=1.0,
+                initial_value=100.0,
+            )
+            weight_rest = server.gui.add_slider(
+                label="Rest Pose",
+                min=0.0,
+                max=1.0,
+                step=0.01,
+                initial_value=0.01,
+            )
+            weight_manipulability = server.gui.add_slider(
+                label="Manipulability",
+                min=0.0,
+                max=1.0,
+                step=0.01,
+                initial_value=0.01,
+            )
+
+        with server.gui.add_folder("Collision Costs"):
+            weight_self_collision = server.gui.add_slider(
+                label="Self Collision",
+                min=0.0,
+                max=50.0,
+                step=1.0,
+                initial_value=0.0,
+            )
+            weight_world_collision = server.gui.add_slider(
+                label="World Collision",
+                min=0.0,
+                max=100.0,
+                step=1.0,
+                # initial_value=10.0,
+                initial_value=0.0,
+            )
+
+    speed_percentage = server.gui.add_slider(
+        label="Speed percentage",
+        min=0.0,
+        max=1.0,
+        step=0.1,
+        initial_value=0.5,
+    )
+
+    sol_traj = np.array(
+        robot.joint_var_cls.default_factory()[None].repeat(len_traj, axis=0)
+    )
+    update_robot_visualization(
+        urdf_vis, slider_handles, robot, robot_coll, server, sol_traj[0]
+    )
+
+    target_link_idx = robot.links.names.index(target_link_name)
+    target_link_pose = robot.forward_kinematics(sol_traj)[target_link_idx]
+    print(f'target_link_pose initial: {target_link_pose}')
+
+    mesh = trimesh.load_mesh(str(Path(__file__).parent / 'storage_box.stl'))
+    mesh.apply_scale(0.005)
+    box_handle = server.scene.add_transform_controls(
+        "/box", scale=0.2,
+        wxyz=(0.707, 0.707, 0, 0),
+        position=(0.75, -0.3, 0)
+    )
+    server.scene.add_mesh_trimesh("/box/visual", mesh=mesh)
+    # pts, radius = voxel_fit_volume_sample_surface_mesh(mesh, n_spheres=500,
+    #                                                    surface_sphere_radius=0.005)
+    pts, radius = sample_even_fit_mesh(mesh, n_spheres=200, sphere_radius=0.005)
+    # print(f'{type(pts)=}, {pts=}')
+    box_spheres = pk.collision.Sphere.from_center_and_radius(
+        center=pts, radius=radius)
+    server.scene.add_mesh_trimesh(
+        "/box/coll", mesh=box_spheres.to_trimesh(),
+    )
+
+    # Get current configuration from sliders
+    current_cfg = np.array([slider.value for slider in slider_handles])
+    sol_traj = np.array([current_cfg] * len_traj)
+
+    is_planning = False
+    is_executing = False
+    traj_index = 0
+    execution_mode = server.gui.add_dropdown(
+        label="Execution Mode",
+        options=["Online (Replan)", "Offline (Execute Once)"],
+        initial_value="Offline (Execute Once)",
+    )
+
+    plan_button = server.gui.add_button(
+        label="Start Planning",
+    )
+
+    @plan_button.on_click
+    def _(_) -> None:
+        nonlocal is_planning, is_executing, traj_index
+        if execution_mode.value == "Online (Replan)":
+            is_planning = not is_planning
+            plan_button.name = "Stop Planning" if is_planning else "Start Planning"
+        else:  # Offline mode
+            if not is_executing:
+                is_executing = True
+                traj_index = 0
+                plan_button.name = "Planning..."
+            else:
+                is_executing = False
+                plan_button.name = "Start Planning"
+
+    while True:
+        # Online replanning mode
+        if is_planning and execution_mode.value == "Online (Replan)":
+            # Get current robot configuration
+            current_cfg = sol_traj[0]
+
+            # Update sphere obstacle position
+            sphere_coll_world_current = sphere_coll.transform_from_wxyz_position(
+                wxyz=np.array(sphere_handle.wxyz),
+                position=np.array(sphere_handle.position),
+            )
+            box_coll_world_current = box_spheres.transform_from_wxyz_position(
+                wxyz=np.array(box_handle.wxyz),
+                position=np.array(box_handle.position),
+            )
+            world_coll_list = [plane_coll, sphere_coll_world_current, box_coll_world_current]
+
+            # Plan from CURRENT position (critical!)
+            sol_traj, sol_pos, sol_wxyz = pks.wu_solve_online_planning(
+                robot=robot,
+                robot_coll=robot_coll,
+                world_coll=world_coll_list,
+                target_link_name=target_link_name,
+                target_position=np.array(ik_target_handle.position),
+                target_wxyz=np.array(ik_target_handle.wxyz),
+                timesteps=len_traj,
+                dt=dt,
+                start_cfg=sol_traj[0],  # ← 現在位置から！
+                prev_sols=sol_traj,      # ← ウォームスタート
+                weight_pose_match_rotation=weight_pose_match_rotation.value,
+                weight_pose_match_translation=weight_pose_match_translation.value,
+                weight_pose_smoothness=weight_pose_smoothness.value,
+                weight_match_start_pose=weight_match_start_pose.value,
+                weight_match_joint_to_pose=weight_match_joint_to_pose.value,
+                weight_smoothness=weight_smoothness.value,
+                weight_limit_velocity=weight_limit_velocity.value,
+                weight_limit=weight_limit.value,
+                weight_rest=weight_rest.value,
+                weight_manipulability=weight_manipulability.value,
+                weight_self_collision=weight_self_collision.value,
+                weight_world_collision=weight_world_collision.value,
+            )
+
+            if hasattr(target_frame_handle, "batched_positions"):
+                target_frame_handle.batched_positions = np.array(
+                    sol_pos)  # type: ignore[attr-defined]
+                target_frame_handle.batched_wxyzs = np.array(sol_wxyz)  # type: ignore[attr-defined]
+            else:
+                # This is an older version of Viser.
+                target_frame_handle.positions_batched = np.array(
+                    sol_pos)  # type: ignore[attr-defined]
+                target_frame_handle.wxyzs_batched = np.array(sol_wxyz)  # type: ignore[attr-defined]
+
+            # Execute first step of trajectory
+            update_robot_visualization(
+                urdf_vis, slider_handles, robot, robot_coll, server, sol_traj[0]
+            )
+
+            # Check if target is reached (use sol_traj[0] which is the actual robot position)
+            target_link_idx = robot.links.names.index(target_link_name)
+            current_fk = robot.forward_kinematics(sol_traj[0])  # Use actual position!
+            current_pos = current_fk[target_link_idx][4:]  # Last 3 elements are xyz position
+            target_pos = np.array(ik_target_handle.position)
+            distance = np.linalg.norm(current_pos - target_pos)
+
+            if distance < 0.01:
+                is_planning = False
+                plan_button.name = "Start Online Planning"
+                print(f"Target reached! Distance: {distance:.6f}")
+            else:
+                print(f'{distance=}')
+
+        # Offline execution mode
+        elif is_executing and execution_mode.value == "Offline (Execute Once)":
+            if traj_index == 0:
+                # Plan once at the beginning
+                current_cfg = np.array([slider.value for slider in slider_handles])
+
+                sphere_coll_world_current = sphere_coll.transform_from_wxyz_position(
+                    wxyz=np.array(sphere_handle.wxyz),
+                    position=np.array(sphere_handle.position),
+                )
+                box_coll_world_current = box_spheres.transform_from_wxyz_position(
+                    wxyz=np.array(box_handle.wxyz),
+                    position=np.array(box_handle.position),
+                )
+                world_coll_list = [plane_coll, sphere_coll_world_current,
+                                   box_coll_world_current]
+
+                print("Planning trajectory...")
+                sol_traj, sol_pos, sol_wxyz = pks.wu_solve_online_planning(
+                    robot=robot,
+                    robot_coll=robot_coll,
+                    world_coll=world_coll_list,
+                    target_link_name=target_link_name,
+                    target_position=np.array(ik_target_handle.position),
+                    target_wxyz=np.array(ik_target_handle.wxyz),
+                    timesteps=len_traj,
+                    dt=dt,
+                    start_cfg=current_cfg,
+                    prev_sols=sol_traj,  # todo ik+linear interp
+                    weight_pose_match_rotation=weight_pose_match_rotation.value,
+                    weight_pose_match_translation=weight_pose_match_translation.value,
+                    weight_pose_smoothness=weight_pose_smoothness.value,
+                    weight_match_start_pose=weight_match_start_pose.value,
+                    weight_match_joint_to_pose=weight_match_joint_to_pose.value,
+                    weight_smoothness=weight_smoothness.value,
+                    weight_limit_velocity=weight_limit_velocity.value,
+                    weight_limit=weight_limit.value,
+                    weight_rest=weight_rest.value,
+                    weight_manipulability=weight_manipulability.value,
+                    weight_self_collision=weight_self_collision.value,
+                    weight_world_collision=weight_world_collision.value,
+                )
+
+                # Apply TOPPRA time parameterization
+                print("Applying TOPPRA time parameterization...")
+                print(f'{sol_traj[0]=}')
+                ts_sample, qs_sample, qds_sample, qdds_sample = time_parameterize_toppra(
+                    waypoints=np.vstack([current_cfg, sol_traj]),
+                    max_velocity=speed_percentage.value * 3.14,  # rad/s
+                    max_acceleration=speed_percentage.value * 200.0 * np.pi / 180.0,  # 800 deg/s^2
+                )
+                print(f'{current_cfg=}')
+                print(f'{qs_sample=}')
+                print(f'{ts_sample=}')
+
+                # Update sol_traj with time-parameterized trajectory
+                # sol_traj = qs_sample
+
+                print(
+                    f"Time-parameterized trajectory: {len(sol_traj)} samples, "
+                    f"duration: {ts_sample[-1]:.3f}s"
+                )
+                node.send_joint_trajectory(
+                    ts_sample, qs_sample, qds_sample, qdds_sample, current_cfg)
+
+                if hasattr(target_frame_handle, "batched_positions"):
+                    target_frame_handle.batched_positions = np.array(sol_pos)
+                    target_frame_handle.batched_wxyzs = np.array(sol_wxyz)
+                else:
+                    target_frame_handle.positions_batched = np.array(sol_pos)
+                    target_frame_handle.wxyzs_batched = np.array(sol_wxyz)
+
+            # Execute trajectory step by step
+            # if traj_index < len(sol_traj):
+            #     # Calculate and print distance to target
+            #     target_link_idx = robot.links.names.index(target_link_name)
+            #     current_fk = robot.forward_kinematics(sol_traj[traj_index])
+            #     current_pos = current_fk[target_link_idx][4:]
+            #     target_pos = np.array(ik_target_handle.position)
+            #     distance = np.linalg.norm(current_pos - target_pos)
+            #     print(f'Step {traj_index}/{len(sol_traj)}: {distance=:.6f}')
+            #     print(f'{sol_traj[traj_index]=}')
+            #     update_robot_visualization(
+            #         urdf_vis, slider_handles, robot, robot_coll, server, sol_traj[traj_index]
+            #     )
+            #     traj_index += 1
+            if traj_index < len(qs_sample):
+                # Calculate and print distance to target
+                target_link_idx = robot.links.names.index(target_link_name)
+                current_fk = robot.forward_kinematics(qs_sample[traj_index])
+                current_pos = current_fk[target_link_idx][4:]
+                target_pos = np.array(ik_target_handle.position)
+                distance = np.linalg.norm(current_pos - target_pos)
+                print(f'Step {traj_index}/{len(qs_sample)}: {distance=:.6f}')
+                update_robot_visualization(
+                    urdf_vis, slider_handles, robot, robot_coll, server, qs_sample[traj_index]
+                )
+                traj_index += 1
+            else:
+                # Finished executing
+                is_executing = False
+                plan_button.name = "Start Planning"
+                print("Trajectory execution completed!")
+                traj_index = 0
+
+        # time.sleep(dt*0.1)
+
+
+if __name__ == "__main__":
+    main()
