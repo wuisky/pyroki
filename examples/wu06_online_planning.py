@@ -22,19 +22,23 @@ import os
 from pathlib import Path
 import time
 
-# Enable JAX persistent compilation cache
-# Use a permanent directory (not /tmp which is cleared on reboot)
-os.environ["JAX_COMPILATION_CACHE_DIR"] = str(Path.home() / ".cache" / "jax")
-os.environ["JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES"] = "-1"
-os.environ["JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS"] = "0"
+import toppra as ta
+import toppra.constraint as constraint
+import toppra.algorithm as algo
+
+# # Enable JAX persistent compilation cache
+# # Use a permanent directory (not /tmp which is cleared on reboot)
+# os.environ["JAX_COMPILATION_CACHE_DIR"] = str(Path.home() / ".cache" / "jax")
+# os.environ["JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES"] = "-1"
+# os.environ["JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS"] = "0"
 
 
-# Enable JAX persistent compilation cache
-os.environ["JAX_COMPILATION_CACHE_DIR"] = "/tmp/jax_cache"
-# JAX 0.7+ uses different config names
-jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
-jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
-jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+# # Enable JAX persistent compilation cache
+# os.environ["JAX_COMPILATION_CACHE_DIR"] = "/tmp/jax_cache"
+# # JAX 0.7+ uses different config names
+# jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
+# jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+# jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 
 
 def create_robot_control_sliders(
@@ -82,6 +86,82 @@ def update_robot_visualization(
         slider.value = float(value)
     robot_coll_mesh = robot_coll.at_config(robot, config).to_trimesh()
     server.scene.add_mesh_trimesh("/robot_coll", mesh=robot_coll_mesh, visible=False)
+
+
+def time_parameterize_toppra(
+    waypoints: np.ndarray,
+    max_velocity: float = 3.14,  # rad/s
+    max_acceleration: float = 800.0 * np.pi / 180.0,  # 800 deg/s^2 -> rad/s^2
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Time parameterization using TOPPRA with quintic spline interpolation.
+
+    Args:
+        waypoints: (N, n_dof) array of joint configurations
+        max_velocity: Maximum joint velocity [rad/s]
+        max_acceleration: Maximum joint acceleration [rad/s^2]
+
+    Returns:
+        ts_sample: Time points for interpolated trajectory
+        qs_sample: Joint positions at sample points
+        qds_sample: Joint velocities at sample points
+        qdds_sample: Joint accelerations at sample points
+    """
+
+    n_waypoints, n_dof = waypoints.shape
+
+    # Create path parameter (0 to 1)
+    # Use arbitrary spacing - TOPPRA will optimize time intervals
+    ss = np.linspace(0, 1, n_waypoints)
+
+    # Create quintic spline path with zero velocity/acceleration at endpoints
+    path = ta.SplineInterpolator(ss, waypoints, bc_type='clamped')
+
+    # Create velocity and acceleration constraints
+    # Stack lower and upper bounds as (n_dof, 2) array
+    vlim = np.stack([
+        np.full(n_dof, -max_velocity),
+        np.full(n_dof, max_velocity)
+    ], axis=1)  # shape (n_dof, 2)
+    alim = np.stack([
+        np.full(n_dof, -max_acceleration),
+        np.full(n_dof, max_acceleration)
+    ], axis=1)  # shape (n_dof, 2)
+
+    pc_vel = constraint.JointVelocityConstraint(vlim)
+    pc_acc = constraint.JointAccelerationConstraint(alim)
+
+    # Setup and solve optimization problem
+    instance = algo.TOPPRA(
+        [pc_vel, pc_acc],
+        path,
+        solver_wrapper='seidel',
+    )
+
+    jnt_traj = instance.compute_trajectory()
+
+    if jnt_traj is None:
+        print("TOPPRA failed to find solution, using original waypoints")
+        # Return simple linear interpolation as fallback
+        ts_sample = np.linspace(0, (n_waypoints - 1) * 0.1, n_waypoints)
+        qs_sample = waypoints
+        qds_sample = np.zeros_like(waypoints)
+        qdds_sample = np.zeros_like(waypoints)
+        return ts_sample, qs_sample, qds_sample, qdds_sample
+
+    # Sample the time-parameterized trajectory
+    duration = jnt_traj.duration
+    ts_sample = np.linspace(0, duration, int(duration / 0.1))  # 10 Hz sampling
+    qs_sample = jnt_traj(ts_sample)
+    qds_sample = jnt_traj(ts_sample, 1)  # First derivative
+    qdds_sample = jnt_traj(ts_sample, 2)  # Second derivative
+
+    print(f"TOPPRA: Original {n_waypoints} waypoints -> {len(ts_sample)} samples")
+    print(f"Total duration: {duration:.3f}s")
+    print(f"Max velocity: {np.max(np.abs(qds_sample)):.3f} rad/s")
+    print(f"Max acceleration: {np.max(np.abs(qdds_sample)):.3f} rad/s^2")
+
+    return ts_sample, qs_sample, qds_sample, qdds_sample
 
 
 def main():
@@ -279,7 +359,7 @@ def main():
     execution_mode = server.gui.add_dropdown(
         label="Execution Mode",
         options=["Online (Replan)", "Offline (Execute Once)"],
-        initial_value="Online (Replan)",
+        initial_value="Offline (Execute Once)",
     )
 
     plan_button = server.gui.add_button(
@@ -415,7 +495,22 @@ def main():
                     weight_self_collision=weight_self_collision.value,
                     weight_world_collision=weight_world_collision.value,
                 )
-                print(f"Trajectory planned! Executing {len(sol_traj)} steps...")
+
+                # Apply TOPPRA time parameterization
+                print("Applying TOPPRA time parameterization...")
+                ts_sample, qs_sample, qds_sample, qdds_sample = time_parameterize_toppra(
+                    waypoints=sol_traj,
+                    max_velocity=3.14,  # rad/s
+                    max_acceleration=800.0 * np.pi / 180.0,  # 800 deg/s^2
+                )
+
+                # Update sol_traj with time-parameterized trajectory
+                # sol_traj = qs_sample
+
+                print(
+                    f"Time-parameterized trajectory: {len(sol_traj)} samples, "
+                    f"duration: {ts_sample[-1]:.3f}s"
+                )
 
                 if hasattr(target_frame_handle, "batched_positions"):
                     target_frame_handle.batched_positions = np.array(sol_pos)
@@ -425,17 +520,29 @@ def main():
                     target_frame_handle.wxyzs_batched = np.array(sol_wxyz)
 
             # Execute trajectory step by step
-            if traj_index < len(sol_traj):
+            # if traj_index < len(sol_traj):
+            #     # Calculate and print distance to target
+            #     target_link_idx = robot.links.names.index(target_link_name)
+            #     current_fk = robot.forward_kinematics(sol_traj[traj_index])
+            #     current_pos = current_fk[target_link_idx][4:]
+            #     target_pos = np.array(ik_target_handle.position)
+            #     distance = np.linalg.norm(current_pos - target_pos)
+            #     print(f'Step {traj_index}/{len(sol_traj)}: {distance=:.6f}')
+            #     print(f'{sol_traj[traj_index]=}')
+            #     update_robot_visualization(
+            #         urdf_vis, slider_handles, robot, robot_coll, server, sol_traj[traj_index]
+            #     )
+            #     traj_index += 1
+            if traj_index < len(qs_sample):
                 # Calculate and print distance to target
                 target_link_idx = robot.links.names.index(target_link_name)
-                current_fk = robot.forward_kinematics(sol_traj[traj_index])
+                current_fk = robot.forward_kinematics(qs_sample[traj_index])
                 current_pos = current_fk[target_link_idx][4:]
                 target_pos = np.array(ik_target_handle.position)
                 distance = np.linalg.norm(current_pos - target_pos)
-                # print(f'Step {traj_index}/{len(sol_traj)}: {distance=:.6f}')
-                print(f'{sol_traj[traj_index]=}')
+                print(f'Step {traj_index}/{len(qs_sample)}: {distance=:.6f}')
                 update_robot_visualization(
-                    urdf_vis, slider_handles, robot, robot_coll, server, sol_traj[traj_index]
+                    urdf_vis, slider_handles, robot, robot_coll, server, qs_sample[traj_index]
                 )
                 traj_index += 1
             else:
