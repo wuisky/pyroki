@@ -254,6 +254,41 @@ def _solve_online_planning_jax(
         ]
     )
 
+    # World collision avoidance using swept volumes.
+    def compute_world_coll_residual(
+        vals: jaxls.VarValues,
+        robot: pk.Robot,
+        robot_coll: pk.collision.RobotCollision,
+        world_coll_obj: pk.collision.CollGeom,
+        prev_traj_vars: jaxls.Var[jax.Array],
+        curr_traj_vars: jaxls.Var[jax.Array],
+    ):
+        coll = robot_coll.get_swept_capsules(
+            robot, vals[prev_traj_vars], vals[curr_traj_vars]
+        )
+        dist = pk.collision.collide(
+            coll.reshape((-1, 1)), world_coll_obj.reshape((1, -1))
+        )  # >0 means no collision
+
+        # Apply safety margin: require at least 5cm clearance
+        return dist.flatten() - 0.01
+
+    for world_coll_obj in world_coll:
+        factors.append(
+            jaxls.Cost(
+                compute_world_coll_residual,
+                (
+                    jax.tree.map(lambda x: x[None], robot),
+                    jax.tree.map(lambda x: x[None], robot_coll),
+                    jax.tree.map(lambda x: x[None], world_coll_obj),
+                    robot.joint_var_cls(jnp.arange(0, timesteps - 1)),
+                    robot.joint_var_cls(jnp.arange(1, timesteps)),
+                ),
+                kind="constraint_geq_zero",
+                name="world Collision (sweep)",
+            )
+        )
+
     solution = (
         jaxls.LeastSquaresProblem(factors, [traj_var, pose_var])
         .analyze()
