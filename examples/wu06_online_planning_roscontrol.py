@@ -175,7 +175,7 @@ def update_robot_visualization(
     for slider, value in zip(slider_handles, config):
         slider.value = float(value)
     robot_coll_mesh = robot_coll.at_config(robot, config).to_trimesh()
-    server.scene.add_mesh_trimesh("/robot_coll", mesh=robot_coll_mesh, visible=False)
+    server.scene.add_mesh_trimesh("/robot_coll", mesh=robot_coll_mesh, visible=True)
 
 
 def time_parameterize_toppra(
@@ -268,7 +268,7 @@ def main():
     urdf_path = str(Path(__file__).parent / '../ur5e/ur5e.urdf.sphere')
     target_link_name = 'tool0'
     urdf = yourdfpy.URDF.load(urdf_path)
-    sphere_json_path = Path(__file__).parent / "../ur5e/ur5e_spheres.json"
+    sphere_json_path = Path(__file__).parent / "../ur5e/ur5e.urdf_spherized.json"
     with open(sphere_json_path, "r") as f:
         sphere_decomposition = json.load(f)
     robot_coll = pk.collision.RobotCollision.from_sphere_decomposition(
