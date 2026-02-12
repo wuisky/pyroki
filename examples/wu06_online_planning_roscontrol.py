@@ -446,103 +446,27 @@ def main():
     current_cfg = np.array([slider.value for slider in slider_handles])
     sol_traj = np.array([current_cfg] * len_traj)
 
-    is_planning = False
-    is_executing = False
+    is_executing = True
     traj_index = 0
-    execution_mode = server.gui.add_dropdown(
-        label="Execution Mode",
-        options=["Online (Replan)", "Offline (Execute Once)"],
-        initial_value="Offline (Execute Once)",
-    )
 
     plan_button = server.gui.add_button(
-        label="Start Planning",
+        label="Planning",
     )
 
     @plan_button.on_click
     def _(_) -> None:
-        nonlocal is_planning, is_executing, traj_index
-        if execution_mode.value == "Online (Replan)":
-            is_planning = not is_planning
-            plan_button.name = "Stop Planning" if is_planning else "Start Planning"
-        else:  # Offline mode
-            if not is_executing:
-                is_executing = True
-                traj_index = 0
-                plan_button.name = "Planning..."
-            else:
-                is_executing = False
-                plan_button.name = "Start Planning"
+        nonlocal is_executing, traj_index
+        if not is_executing:
+            is_executing = True
+            traj_index = 0
+            plan_button.name = "Planning..."
+        else:
+            is_executing = False
+            plan_button.name = "Start Planning"
 
     while True:
-        # Online replanning mode
-        if is_planning and execution_mode.value == "Online (Replan)":
-            # Get current robot configuration
-            current_cfg = sol_traj[0]
-            box_coll_world_current = box_spheres.transform_from_wxyz_position(
-                wxyz=np.array(box_handle.wxyz),
-                position=np.array(box_handle.position),
-            )
-            world_coll_list = [plane_coll,
-                               box_coll_world_current]
-
-            # Plan from CURRENT position (critical!)
-            sol_traj, sol_pos, sol_wxyz = pks.wu_solve_online_planning(
-                robot=robot,
-                robot_coll=robot_coll,
-                world_coll=world_coll_list,
-                target_link_name=target_link_name,
-                target_position=np.array(ik_target_handle.position),
-                target_wxyz=np.array(ik_target_handle.wxyz),
-                timesteps=len_traj,
-                dt=dt,
-                start_cfg=sol_traj[0],  # ← 現在位置から！
-                prev_sols=sol_traj,      # ← ウォームスタート
-                weight_pose_match_rotation=weight_pose_match_rotation.value,
-                weight_pose_match_translation=weight_pose_match_translation.value,
-                weight_pose_smoothness=weight_pose_smoothness.value,
-                weight_match_start_pose=weight_match_start_pose.value,
-                weight_match_joint_to_pose=weight_match_joint_to_pose.value,
-                weight_smoothness=weight_smoothness.value,
-                weight_limit_velocity=weight_limit_velocity.value,
-                weight_limit=weight_limit.value,
-                weight_rest=weight_rest.value,
-                weight_manipulability=weight_manipulability.value,
-                weight_self_collision=weight_self_collision.value,
-                weight_world_collision=weight_world_collision.value,
-            )
-
-            if hasattr(target_frame_handle, "batched_positions"):
-                target_frame_handle.batched_positions = np.array(
-                    sol_pos)  # type: ignore[attr-defined]
-                target_frame_handle.batched_wxyzs = np.array(sol_wxyz)  # type: ignore[attr-defined]
-            else:
-                # This is an older version of Viser.
-                target_frame_handle.positions_batched = np.array(
-                    sol_pos)  # type: ignore[attr-defined]
-                target_frame_handle.wxyzs_batched = np.array(sol_wxyz)  # type: ignore[attr-defined]
-
-            # Execute first step of trajectory
-            update_robot_visualization(
-                urdf_vis, slider_handles, robot, robot_coll, server, sol_traj[0]
-            )
-
-            # Check if target is reached (use sol_traj[0] which is the actual robot position)
-            target_link_idx = robot.links.names.index(target_link_name)
-            current_fk = robot.forward_kinematics(sol_traj[0])  # Use actual position!
-            current_pos = current_fk[target_link_idx][4:]  # Last 3 elements are xyz position
-            target_pos = np.array(ik_target_handle.position)
-            distance = np.linalg.norm(current_pos - target_pos)
-
-            if distance < 0.01:
-                is_planning = False
-                plan_button.name = "Start Online Planning"
-                print(f"Target reached! Distance: {distance:.6f}")
-            else:
-                print(f'{distance=}')
-
         # Offline execution mode
-        elif is_executing and execution_mode.value == "Offline (Execute Once)":
+        if is_executing:
             if traj_index == 0:
                 # Plan once at the beginning
                 current_cfg = np.array([slider.value for slider in slider_handles])
@@ -640,8 +564,6 @@ def main():
                 plan_button.name = "Start Planning"
                 print("Trajectory execution completed!")
                 traj_index = 0
-
-        # time.sleep(dt*0.1)
 
 
 if __name__ == "__main__":
