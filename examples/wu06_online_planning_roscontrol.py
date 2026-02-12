@@ -284,9 +284,6 @@ def main():
     plane_coll = HalfSpace.from_point_and_normal(
         np.array([0.0, 0.0, 0.0]), np.array([0.0, 0.0, 1.0])
     )
-    sphere_coll = Sphere.from_center_and_radius(
-        np.array([0.0, 0.0, 0.0]), np.array([0.05])
-    )
 
     # Define the online planning parameters.
     len_traj, dt = 10, 0.1
@@ -308,11 +305,6 @@ def main():
         position=(0.3398, -0.12158905, 0.5132406), wxyz=(0, 0.707, -0.707, 0)
     )
 
-    # Create interactive controller and mesh for the sphere obstacle.
-    sphere_handle = server.scene.add_transform_controls(
-        "/obstacle", scale=0.2, position=(0.4, 0.3, 0.4)
-    )
-    server.scene.add_mesh_trimesh("/obstacle/mesh", mesh=sphere_coll.to_trimesh())
     target_frame_handle = server.scene.add_batched_axes(
         "target_frame",
         axes_length=0.05,
@@ -441,9 +433,8 @@ def main():
         position=(0.75, -0.3, 0)
     )
     server.scene.add_mesh_trimesh("/box/visual", mesh=mesh)
-    # pts, radius = voxel_fit_volume_sample_surface_mesh(mesh, n_spheres=500,
-    #                                                    surface_sphere_radius=0.005)
-    pts, radius = sample_even_fit_mesh(mesh, n_spheres=200, sphere_radius=0.005)
+    # pts, radius = voxel_fit_volume_sample_surface_mesh(mesh, n_spheres=500, surface_sphere_radius=0.005)
+    pts, radius = sample_even_fit_mesh(mesh, n_spheres=500, sphere_radius=0.005)
     # print(f'{type(pts)=}, {pts=}')
     box_spheres = pk.collision.Sphere.from_center_and_radius(
         center=pts, radius=radius)
@@ -488,17 +479,12 @@ def main():
         if is_planning and execution_mode.value == "Online (Replan)":
             # Get current robot configuration
             current_cfg = sol_traj[0]
-
-            # Update sphere obstacle position
-            sphere_coll_world_current = sphere_coll.transform_from_wxyz_position(
-                wxyz=np.array(sphere_handle.wxyz),
-                position=np.array(sphere_handle.position),
-            )
             box_coll_world_current = box_spheres.transform_from_wxyz_position(
                 wxyz=np.array(box_handle.wxyz),
                 position=np.array(box_handle.position),
             )
-            world_coll_list = [plane_coll, sphere_coll_world_current, box_coll_world_current]
+            world_coll_list = [plane_coll,
+                               box_coll_world_current]
 
             # Plan from CURRENT position (critical!)
             sol_traj, sol_pos, sol_wxyz = pks.wu_solve_online_planning(
@@ -560,16 +546,11 @@ def main():
             if traj_index == 0:
                 # Plan once at the beginning
                 current_cfg = np.array([slider.value for slider in slider_handles])
-
-                sphere_coll_world_current = sphere_coll.transform_from_wxyz_position(
-                    wxyz=np.array(sphere_handle.wxyz),
-                    position=np.array(sphere_handle.position),
-                )
                 box_coll_world_current = box_spheres.transform_from_wxyz_position(
                     wxyz=np.array(box_handle.wxyz),
                     position=np.array(box_handle.position),
                 )
-                world_coll_list = [plane_coll, sphere_coll_world_current,
+                world_coll_list = [plane_coll,
                                    box_coll_world_current]
 
                 print("Planning trajectory...")
