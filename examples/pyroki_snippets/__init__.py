@@ -3,6 +3,7 @@ from ._online_planning import solve_online_planning as solve_online_planning
 from ._solve_ik import solve_ik as solve_ik
 from ._solve_ik_with_base import solve_ik_with_base as solve_ik_with_base
 from ._solve_ik_with_collision import solve_ik_with_collision as solve_ik_with_collision
+from ._solve_ik_with_collision_custom import solve_ik_with_collision_custom as solve_ik_with_collision_custom
 from ._solve_ik_with_manipulability import (
     solve_ik_with_manipulability as solve_ik_with_manipulability,
 )

@@ -200,7 +200,12 @@ def main():
     server.scene.add_grid("/ground", width=2, height=2, cell_size=0.1)
     server.gui.configure_theme(dark_mode=True)
     urdf_vis = ViserUrdf(server, urdf, root_node_name="/robot")
-    with server.gui.add_folder("Joint   position"):
+    urdf_vis_mc = ViserUrdf(server, urdf, root_node_name="/robot_mc",
+                            mesh_color_override=(0.3, 0.3, 0.8, 0.5))
+    urdf_vis_mc.update_cfg(default_cfg)
+    current_mc_config = default_cfg.copy()
+
+    with server.gui.add_folder("Joint   position", expand_by_default=False):
         (slider_handles, initial_config) = create_robot_control_sliders(
             server, urdf_vis
         )
@@ -219,6 +224,26 @@ def main():
         batched_positions=np.zeros((25, 3)),
         batched_wxyzs=np.array([[1.0, 0.0, 0.0, 0.0]] * 25),
     )
+
+    with server.gui.add_folder("ik weights"):
+        rest_weight = server.gui.add_slider(
+            # "Rest Weight", 0.0, 0.5, 0.01, 0.02
+            # "Rest Weight", 0.0, 0.5, 0.01, 0.5
+            "Rest Weight", 0.0, 30.0, 1.0, 0.0,
+        )
+        pose_weight = server.gui.add_slider(
+            "Pose Weight", 5.0, 100.0, 1.0, 19.0
+        )
+
+        collision_weight = server.gui.add_slider(
+            "Collision Weight", 0.0, 30.0, 1.0, 15.0
+        )
+
+        elbow_height_weight = server.gui.add_slider(
+            "Elbow Height Weight", 0.0, 10.0, 0.001, 0.25
+        )
+
+        realtime_ik = server.gui.add_checkbox("Enable realtime ik", initial_value=False)
 
     # Create weight sliders for cost functions
     with server.gui.add_folder("Cost Weights"):
@@ -312,13 +337,13 @@ def main():
                 initial_value=10.0,
             )
 
-    speed_percentage = server.gui.add_slider(
-        label="Speed percentage",
-        min=0.0,
-        max=1.0,
-        step=0.1,
-        initial_value=0.5,
-    )
+    # speed_percentage = server.gui.add_slider(
+    #     label="Speed percentage",
+    #     min=0.0,
+    #     max=1.0,
+    #     step=0.1,
+    #     initial_value=0.5,
+    # )
 
     sol_traj = np.array(
         robot.joint_var_cls.default_factory()[None].repeat(len_traj, axis=0)
@@ -353,7 +378,7 @@ def main():
     sol_traj = np.array([current_cfg] * len_traj)
     sol_traj_init = np.array([current_cfg] * len_traj)
 
-    is_executing = True
+    is_executing = False
     traj_index = 0
 
     plan_button = server.gui.add_button(
@@ -370,6 +395,39 @@ def main():
         else:
             is_executing = False
             plan_button.name = "Start Planning"
+
+    # Add callback when IK target is moved
+
+    @ik_target_handle.on_update
+    def _(_: viser.TransformControlsHandle) -> None:
+        nonlocal current_mc_config
+        """Callback when IK target is updated."""
+        box_coll_world_current = box_spheres.transform_from_wxyz_position(
+            wxyz=np.array(box_handle.wxyz),
+            position=np.array(box_handle.position),
+        )
+        world_coll_list = [plane_coll, box_coll_world_current]
+        weights = np.ones(len(world_coll_list)) * collision_weight.value
+        rest_weights = np.array([rest_weight.value] * robot.joints.num_actuated_joints)
+        rest_weights[0] = 0  # allow joint rotation intensly
+        if realtime_ik.value:
+            # Realtime IK mode
+            ik_sol = pks.solve_ik_with_collision_custom(
+                robot=robot,
+                coll=robot_coll,
+                world_coll_list=world_coll_list,
+                target_link_name=target_link_name,
+                target_position=np.array(ik_target_handle.position),
+                target_wxyz=np.array(ik_target_handle.wxyz),
+                weights=weights,
+                pose_weight=pose_weight.value,
+                rest_weight=rest_weights,
+                initial_joint_angles=current_mc_config,
+                elbow_height_weight=elbow_height_weight.value,
+                elbow_link_name='forearm_link',
+            )
+            urdf_vis_mc.update_cfg(ik_sol)
+            current_mc_config = ik_sol.copy()
 
     while True:
         # Offline execution mode

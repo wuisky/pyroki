@@ -22,6 +22,7 @@ from ._residuals import (
     self_collision_residual,
     smoothness_residual,
     world_collision_residual,
+    elbow_height_residual,
 )
 from ._residuals._pose_residual_analytic_jac import (
     pose_cost_analytic_jac as pose_cost_analytic_jac,
@@ -64,3 +65,5 @@ limit_velocity_constraint = Cost.factory(kind="constraint_leq_zero")(
 world_collision_constraint = Cost.factory(kind="constraint_leq_zero")(
     world_collision_residual
 )
+
+elbow_height_cost = Cost.factory(elbow_height_residual)

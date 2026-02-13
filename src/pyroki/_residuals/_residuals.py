@@ -348,3 +348,30 @@ def limit_jerk_residual(
     )
     residual = jnp.maximum(0.0, jnp.abs(jerk) - jerk_limit)
     return (residual * weight).flatten()
+
+
+def elbow_height_residual(
+    vals: VarValues,
+    robot: Robot,
+    joint_var: Var[Array],
+    link_index: int | Array,
+    weight: Array | float,
+) -> Array:
+    """Penalizes low link height. Higher z-coordinate = lower cost.
+
+    Args:
+        link_index: Index of the link to track.
+        weight: Cost weight.
+    """
+    cfg = vals[joint_var]
+    Ts_link_world = robot.forward_kinematics(cfg)
+    # Get z-coordinate (height) of the specified link
+    link_z = jaxlie.SE3(Ts_link_world[link_index]).translation()[2]
+
+    # Clip to non-negative values to avoid division by negative numbers
+    link_z = jnp.maximum(0.0, link_z)
+
+    # Penalize low height: cost = 1 / (z + epsilon)
+    # Lower z -> higher cost
+    residual = 1.0 / (link_z + 0.1)  # epsilon=0.1 for numerical stability
+    return (residual * weight).flatten()
