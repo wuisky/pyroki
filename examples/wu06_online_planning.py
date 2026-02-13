@@ -203,7 +203,7 @@ def main():
     urdf_vis_mc = ViserUrdf(server, urdf, root_node_name="/robot_mc",
                             mesh_color_override=(0.3, 0.3, 0.8, 0.5))
     urdf_vis_mc.update_cfg(default_cfg)
-    current_mc_config = default_cfg.copy()
+    current_mc_cfg = default_cfg.copy()
 
     with server.gui.add_folder("Joint   position", expand_by_default=False):
         (slider_handles, initial_config) = create_robot_control_sliders(
@@ -243,7 +243,7 @@ def main():
             "Elbow Height Weight", 0.0, 10.0, 0.001, 0.25
         )
 
-        realtime_ik = server.gui.add_checkbox("Enable realtime ik", initial_value=False)
+        realtime_ik = server.gui.add_checkbox("Enable realtime ik", initial_value=True)
 
     # Create weight sliders for cost functions
     with server.gui.add_folder("Cost Weights"):
@@ -376,7 +376,8 @@ def main():
     # Get current configuration from sliders
     current_cfg = np.array([slider.value for slider in slider_handles])
     sol_traj = np.array([current_cfg] * len_traj)
-    sol_traj_init = np.array([current_cfg] * len_traj)
+    qs_sample = sol_traj.copy()
+    # sol_traj_init = np.array([current_cfg] * len_traj)
 
     is_executing = False
     traj_index = 0
@@ -398,9 +399,18 @@ def main():
 
     # Add callback when IK target is moved
 
+    time_step = server.gui.add_slider(
+        "Timestep", min=0, max=len_traj - 1, step=1, initial_value=0
+    )
+    time_step.on_update(  # When sliders move, we update the URDF configuration.
+        lambda _:  urdf_vis_mc.update_cfg(
+            np.array([value for value in qs_sample[time_step.value]])
+        )
+    )
+
     @ik_target_handle.on_update
     def _(_: viser.TransformControlsHandle) -> None:
-        nonlocal current_mc_config
+        nonlocal current_mc_cfg
         """Callback when IK target is updated."""
         box_coll_world_current = box_spheres.transform_from_wxyz_position(
             wxyz=np.array(box_handle.wxyz),
@@ -422,12 +432,12 @@ def main():
                 weights=weights,
                 pose_weight=pose_weight.value,
                 rest_weight=rest_weights,
-                initial_joint_angles=current_mc_config,
+                initial_joint_angles=current_mc_cfg,
                 elbow_height_weight=elbow_height_weight.value,
                 elbow_link_name='forearm_link',
             )
             urdf_vis_mc.update_cfg(ik_sol)
-            current_mc_config = ik_sol.copy()
+            current_mc_cfg = ik_sol.copy()
 
     while True:
         # Offline execution mode
@@ -443,6 +453,9 @@ def main():
                 world_coll_list = [plane_coll,
                                    box_coll_world_current]
 
+                # Linear interpolation from current_cfg to current_mc_cfg
+                prev_sols_interp = np.linspace(current_cfg, current_mc_cfg, len_traj + 1)[1:]
+
                 print("Planning trajectory...")
                 # sol_traj, sol_pos, sol_wxyz = pks.wu_solve_online_planning(
                 qs_sample, sol_pos, sol_wxyz = pks.wu_solve_online_planning(
@@ -455,7 +468,7 @@ def main():
                     timesteps=len_traj,
                     dt=dt,
                     start_cfg=current_cfg,
-                    prev_sols=sol_traj_init,  # todo ik+linear interp
+                    prev_sols=prev_sols_interp,
                     weight_pose_match_rotation=weight_pose_match_rotation.value,
                     weight_pose_match_translation=weight_pose_match_translation.value,
                     weight_pose_smoothness=weight_pose_smoothness.value,
