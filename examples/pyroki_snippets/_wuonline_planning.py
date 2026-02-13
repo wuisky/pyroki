@@ -270,8 +270,8 @@ def _solve_online_planning_jax(
             coll.reshape((-1, 1)), world_coll_obj.reshape((1, -1))
         )  # >0 means no collision
 
-        # Apply safety margin: require at least 5cm clearance
-        return dist.flatten() - 0.01
+        # Apply safety margin: require at least 3cm clearance
+        return dist.flatten() - 0.03
 
     for world_coll_obj in world_coll:
         factors.append(
