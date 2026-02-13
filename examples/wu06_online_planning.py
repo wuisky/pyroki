@@ -85,7 +85,7 @@ def update_robot_visualization(
     for slider, value in zip(slider_handles, config):
         slider.value = float(value)
     robot_coll_mesh = robot_coll.at_config(robot, config).to_trimesh()
-    server.scene.add_mesh_trimesh("/robot_coll", mesh=robot_coll_mesh, visible=False)
+    server.scene.add_mesh_trimesh("/robot_coll", mesh=robot_coll_mesh, visible=True)
 
 
 def time_parameterize_toppra(
@@ -175,7 +175,7 @@ def main():
     urdf_path = str(Path(__file__).parent / '../ur5e/ur5e.urdf.sphere')
     target_link_name = 'tool0'
     urdf = yourdfpy.URDF.load(urdf_path)
-    sphere_json_path = Path(__file__).parent / "../ur5e/ur5e_spheres.json"
+    sphere_json_path = Path(__file__).parent / "../ur5e/ur5e.urdf_spherized.json"
     with open(sphere_json_path, "r") as f:
         sphere_decomposition = json.load(f)
     robot_coll = pk.collision.RobotCollision.from_sphere_decomposition(
@@ -191,9 +191,6 @@ def main():
     plane_coll = HalfSpace.from_point_and_normal(
         np.array([0.0, 0.0, 0.0]), np.array([0.0, 0.0, 1.0])
     )
-    sphere_coll = Sphere.from_center_and_radius(
-        np.array([0.0, 0.0, 0.0]), np.array([0.05])
-    )
 
     # Define the online planning parameters.
     len_traj, dt = 10, 0.1
@@ -201,6 +198,7 @@ def main():
     # Set up visualizer.
     server = viser.ViserServer()
     server.scene.add_grid("/ground", width=2, height=2, cell_size=0.1)
+    server.gui.configure_theme(dark_mode=True)
     urdf_vis = ViserUrdf(server, urdf, root_node_name="/robot")
     with server.gui.add_folder("Joint   position"):
         (slider_handles, initial_config) = create_robot_control_sliders(
@@ -214,11 +212,6 @@ def main():
         position=(0.3398, -0.12158905, 0.5132406), wxyz=(0, 0.707, -0.707, 0)
     )
 
-    # Create interactive controller and mesh for the sphere obstacle.
-    sphere_handle = server.scene.add_transform_controls(
-        "/obstacle", scale=0.2, position=(0.4, 0.3, 0.4)
-    )
-    server.scene.add_mesh_trimesh("/obstacle/mesh", mesh=sphere_coll.to_trimesh())
     target_frame_handle = server.scene.add_batched_axes(
         "target_frame",
         axes_length=0.05,
@@ -316,9 +309,16 @@ def main():
                 min=0.0,
                 max=100.0,
                 step=1.0,
-                # initial_value=10.0,
-                initial_value=0.0,
+                initial_value=10.0,
             )
+
+    speed_percentage = server.gui.add_slider(
+        label="Speed percentage",
+        min=0.0,
+        max=1.0,
+        step=0.1,
+        initial_value=0.5,
+    )
 
     sol_traj = np.array(
         robot.joint_var_cls.default_factory()[None].repeat(len_traj, axis=0)
@@ -336,12 +336,11 @@ def main():
     box_handle = server.scene.add_transform_controls(
         "/box", scale=0.2,
         wxyz=(0.707, 0.707, 0, 0),
-        position=(0.75, -0.3, 0)
+        position=(5.07658497e-01, -7.54795097e-01,  1.37389611e-04),
     )
     server.scene.add_mesh_trimesh("/box/visual", mesh=mesh)
-    # pts, radius = voxel_fit_volume_sample_surface_mesh(mesh, n_spheres=500,
-    #                                                    surface_sphere_radius=0.005)
-    pts, radius = sample_even_fit_mesh(mesh, n_spheres=200, sphere_radius=0.005)
+    # pts, radius = voxel_fit_volume_sample_surface_mesh(mesh, n_spheres=500, surface_sphere_radius=0.005)
+    pts, radius = sample_even_fit_mesh(mesh, n_spheres=500, sphere_radius=0.005)
     # print(f'{type(pts)=}, {pts=}')
     box_spheres = pk.collision.Sphere.from_center_and_radius(
         center=pts, radius=radius)
@@ -352,126 +351,43 @@ def main():
     # Get current configuration from sliders
     current_cfg = np.array([slider.value for slider in slider_handles])
     sol_traj = np.array([current_cfg] * len_traj)
+    sol_traj_init = np.array([current_cfg] * len_traj)
 
-    is_planning = False
-    is_executing = False
+    is_executing = True
     traj_index = 0
-    execution_mode = server.gui.add_dropdown(
-        label="Execution Mode",
-        options=["Online (Replan)", "Offline (Execute Once)"],
-        initial_value="Offline (Execute Once)",
-    )
 
     plan_button = server.gui.add_button(
-        label="Start Planning",
+        label="Planning",
     )
 
     @plan_button.on_click
     def _(_) -> None:
-        nonlocal is_planning, is_executing, traj_index
-        if execution_mode.value == "Online (Replan)":
-            is_planning = not is_planning
-            plan_button.name = "Stop Planning" if is_planning else "Start Planning"
-        else:  # Offline mode
-            if not is_executing:
-                is_executing = True
-                traj_index = 0
-                plan_button.name = "Planning..."
-            else:
-                is_executing = False
-                plan_button.name = "Start Planning"
+        nonlocal is_executing, traj_index
+        if not is_executing:
+            is_executing = True
+            traj_index = 0
+            plan_button.name = "Planning..."
+        else:
+            is_executing = False
+            plan_button.name = "Start Planning"
 
     while True:
-        # Online replanning mode
-        if is_planning and execution_mode.value == "Online (Replan)":
-            # Get current robot configuration
-            current_cfg = sol_traj[0]
-
-            # Update sphere obstacle position
-            sphere_coll_world_current = sphere_coll.transform_from_wxyz_position(
-                wxyz=np.array(sphere_handle.wxyz),
-                position=np.array(sphere_handle.position),
-            )
-            box_coll_world_current = box_spheres.transform_from_wxyz_position(
-                wxyz=np.array(box_handle.wxyz),
-                position=np.array(box_handle.position),
-            )
-            world_coll_list = [plane_coll, sphere_coll_world_current, box_coll_world_current]
-
-            # Plan from CURRENT position (critical!)
-            sol_traj, sol_pos, sol_wxyz = pks.wu_solve_online_planning(
-                robot=robot,
-                robot_coll=robot_coll,
-                world_coll=world_coll_list,
-                target_link_name=target_link_name,
-                target_position=np.array(ik_target_handle.position),
-                target_wxyz=np.array(ik_target_handle.wxyz),
-                timesteps=len_traj,
-                dt=dt,
-                start_cfg=sol_traj[0],  # ← 現在位置から！
-                prev_sols=sol_traj,      # ← ウォームスタート
-                weight_pose_match_rotation=weight_pose_match_rotation.value,
-                weight_pose_match_translation=weight_pose_match_translation.value,
-                weight_pose_smoothness=weight_pose_smoothness.value,
-                weight_match_start_pose=weight_match_start_pose.value,
-                weight_match_joint_to_pose=weight_match_joint_to_pose.value,
-                weight_smoothness=weight_smoothness.value,
-                weight_limit_velocity=weight_limit_velocity.value,
-                weight_limit=weight_limit.value,
-                weight_rest=weight_rest.value,
-                weight_manipulability=weight_manipulability.value,
-                weight_self_collision=weight_self_collision.value,
-                weight_world_collision=weight_world_collision.value,
-            )
-
-            if hasattr(target_frame_handle, "batched_positions"):
-                target_frame_handle.batched_positions = np.array(
-                    sol_pos)  # type: ignore[attr-defined]
-                target_frame_handle.batched_wxyzs = np.array(sol_wxyz)  # type: ignore[attr-defined]
-            else:
-                # This is an older version of Viser.
-                target_frame_handle.positions_batched = np.array(
-                    sol_pos)  # type: ignore[attr-defined]
-                target_frame_handle.wxyzs_batched = np.array(sol_wxyz)  # type: ignore[attr-defined]
-
-            # Execute first step of trajectory
-            update_robot_visualization(
-                urdf_vis, slider_handles, robot, robot_coll, server, sol_traj[0]
-            )
-
-            # Check if target is reached (use sol_traj[0] which is the actual robot position)
-            target_link_idx = robot.links.names.index(target_link_name)
-            current_fk = robot.forward_kinematics(sol_traj[0])  # Use actual position!
-            current_pos = current_fk[target_link_idx][4:]  # Last 3 elements are xyz position
-            target_pos = np.array(ik_target_handle.position)
-            distance = np.linalg.norm(current_pos - target_pos)
-
-            if distance < 0.01:
-                is_planning = False
-                plan_button.name = "Start Online Planning"
-                print(f"Target reached! Distance: {distance:.6f}")
-            else:
-                print(f'{distance=}')
-
         # Offline execution mode
-        elif is_executing and execution_mode.value == "Offline (Execute Once)":
+        if is_executing:
             if traj_index == 0:
                 # Plan once at the beginning
                 current_cfg = np.array([slider.value for slider in slider_handles])
-
-                sphere_coll_world_current = sphere_coll.transform_from_wxyz_position(
-                    wxyz=np.array(sphere_handle.wxyz),
-                    position=np.array(sphere_handle.position),
-                )
                 box_coll_world_current = box_spheres.transform_from_wxyz_position(
                     wxyz=np.array(box_handle.wxyz),
                     position=np.array(box_handle.position),
                 )
-                world_coll_list = [plane_coll, sphere_coll_world_current,
+                print(f'Box position: {box_handle.position}, wxyz: {box_handle.wxyz}')
+                world_coll_list = [plane_coll,
                                    box_coll_world_current]
 
                 print("Planning trajectory...")
-                sol_traj, sol_pos, sol_wxyz = pks.wu_solve_online_planning(
+                # sol_traj, sol_pos, sol_wxyz = pks.wu_solve_online_planning(
+                qs_sample, sol_pos, sol_wxyz = pks.wu_solve_online_planning(
                     robot=robot,
                     robot_coll=robot_coll,
                     world_coll=world_coll_list,
@@ -481,7 +397,7 @@ def main():
                     timesteps=len_traj,
                     dt=dt,
                     start_cfg=current_cfg,
-                    prev_sols=sol_traj,
+                    prev_sols=sol_traj_init,  # todo ik+linear interp
                     weight_pose_match_rotation=weight_pose_match_rotation.value,
                     weight_pose_match_translation=weight_pose_match_translation.value,
                     weight_pose_smoothness=weight_pose_smoothness.value,
@@ -497,20 +413,26 @@ def main():
                 )
 
                 # Apply TOPPRA time parameterization
-                print("Applying TOPPRA time parameterization...")
-                ts_sample, qs_sample, qds_sample, qdds_sample = time_parameterize_toppra(
-                    waypoints=sol_traj,
-                    max_velocity=3.14,  # rad/s
-                    max_acceleration=800.0 * np.pi / 180.0,  # 800 deg/s^2
-                )
+                # print("Applying TOPPRA time parameterization...")
+                # print(f'{sol_traj[0]=}')
+                # ts_sample, qs_sample, qds_sample, qdds_sample = time_parameterize_toppra(
+                #     waypoints=np.vstack([current_cfg, sol_traj]),
+                #     max_velocity=speed_percentage.value * 3.14,  # rad/s
+                #     max_acceleration=speed_percentage.value * 200.0 * np.pi / 180.0,  # 800 deg/s^2
+                # )
+                # print(f'{current_cfg=}')
+                # print(f'{qs_sample=}')
+                # print(f'{ts_sample=}')
 
-                # Update sol_traj with time-parameterized trajectory
-                # sol_traj = qs_sample
+                # # Update sol_traj with time-parameterized trajectory
+                # # sol_traj = qs_sample
 
-                print(
-                    f"Time-parameterized trajectory: {len(sol_traj)} samples, "
-                    f"duration: {ts_sample[-1]:.3f}s"
-                )
+                # print(
+                #     f"Time-parameterized trajectory: {len(sol_traj)} samples, "
+                #     f"duration: {ts_sample[-1]:.3f}s"
+                # )
+                # node.send_joint_trajectory(
+                #     ts_sample, qs_sample, qds_sample, qdds_sample, current_cfg)
 
                 if hasattr(target_frame_handle, "batched_positions"):
                     target_frame_handle.batched_positions = np.array(sol_pos)
@@ -551,8 +473,6 @@ def main():
                 plan_button.name = "Start Planning"
                 print("Trajectory execution completed!")
                 traj_index = 0
-
-        time.sleep(dt)
 
 
 if __name__ == "__main__":
