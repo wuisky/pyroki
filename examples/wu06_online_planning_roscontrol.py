@@ -36,19 +36,19 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from rclpy.qos import (DurabilityPolicy, QoSProfile, ReliabilityPolicy,
                        HistoryPolicy)
 
-# # Enable JAX persistent compilation cache
-# # Use a permanent directory (not /tmp which is cleared on reboot)
-# os.environ["JAX_COMPILATION_CACHE_DIR"] = str(Path.home() / ".cache" / "jax")
-# os.environ["JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES"] = "-1"
-# os.environ["JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS"] = "0"
+# Enable JAX persistent compilation cache
+# Use a permanent directory (not /tmp which is cleared on reboot)
+os.environ["JAX_COMPILATION_CACHE_DIR"] = str(Path.home() / ".cache" / "jax")
+os.environ["JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES"] = "-1"
+os.environ["JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS"] = "0"
 
 
-# # Enable JAX persistent compilation cache
-# os.environ["JAX_COMPILATION_CACHE_DIR"] = "/tmp/jax_cache"
-# # JAX 0.7+ uses different config names
-# jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
-# jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
-# jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+# Enable JAX persistent compilation cache
+os.environ["JAX_COMPILATION_CACHE_DIR"] = "/tmp/jax_cache"
+# JAX 0.7+ uses different config names
+jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
+jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 
 
 class PublisherJointTrajectory(Node):
@@ -430,7 +430,7 @@ def main():
     box_handle = server.scene.add_transform_controls(
         "/box", scale=0.2,
         wxyz=(0.707, 0.707, 0, 0),
-        position=(0.75, -0.3, 0)
+        position=(5.07658497e-01, -7.54795097e-01,  1.37389611e-04),
     )
     server.scene.add_mesh_trimesh("/box/visual", mesh=mesh)
     # pts, radius = voxel_fit_volume_sample_surface_mesh(mesh, n_spheres=500, surface_sphere_radius=0.005)
@@ -445,6 +445,7 @@ def main():
     # Get current configuration from sliders
     current_cfg = np.array([slider.value for slider in slider_handles])
     sol_traj = np.array([current_cfg] * len_traj)
+    sol_traj_init = np.array([current_cfg] * len_traj)
 
     is_executing = True
     traj_index = 0
@@ -479,6 +480,7 @@ def main():
 
                 print("Planning trajectory...")
                 sol_traj, sol_pos, sol_wxyz = pks.wu_solve_online_planning(
+                    # qs_sample, sol_pos, sol_wxyz = pks.wu_solve_online_planning(
                     robot=robot,
                     robot_coll=robot_coll,
                     world_coll=world_coll_list,
@@ -488,7 +490,7 @@ def main():
                     timesteps=len_traj,
                     dt=dt,
                     start_cfg=current_cfg,
-                    prev_sols=sol_traj,  # todo ik+linear interp
+                    prev_sols=sol_traj_init,  # todo ik+linear interp
                     weight_pose_match_rotation=weight_pose_match_rotation.value,
                     weight_pose_match_translation=weight_pose_match_translation.value,
                     weight_pose_smoothness=weight_pose_smoothness.value,
@@ -504,24 +506,24 @@ def main():
                 )
 
                 # Apply TOPPRA time parameterization
-                print("Applying TOPPRA time parameterization...")
-                print(f'{sol_traj[0]=}')
+                # print("Applying TOPPRA time parameterization...")
+                # print(f'{sol_traj[0]=}')
                 ts_sample, qs_sample, qds_sample, qdds_sample = time_parameterize_toppra(
                     waypoints=np.vstack([current_cfg, sol_traj]),
                     max_velocity=speed_percentage.value * 3.14,  # rad/s
                     max_acceleration=speed_percentage.value * 200.0 * np.pi / 180.0,  # 800 deg/s^2
                 )
-                print(f'{current_cfg=}')
-                print(f'{qs_sample=}')
-                print(f'{ts_sample=}')
+                # print(f'{current_cfg=}')
+                # print(f'{qs_sample=}')
+                # print(f'{ts_sample=}')
 
-                # Update sol_traj with time-parameterized trajectory
-                # sol_traj = qs_sample
+                # # Update sol_traj with time-parameterized trajectory
+                # # sol_traj = qs_sample
 
-                print(
-                    f"Time-parameterized trajectory: {len(sol_traj)} samples, "
-                    f"duration: {ts_sample[-1]:.3f}s"
-                )
+                # print(
+                #     f"Time-parameterized trajectory: {len(sol_traj)} samples, "
+                #     f"duration: {ts_sample[-1]:.3f}s"
+                # )
                 node.send_joint_trajectory(
                     ts_sample, qs_sample, qds_sample, qdds_sample, current_cfg)
 
@@ -532,20 +534,6 @@ def main():
                     target_frame_handle.positions_batched = np.array(sol_pos)
                     target_frame_handle.wxyzs_batched = np.array(sol_wxyz)
 
-            # Execute trajectory step by step
-            # if traj_index < len(sol_traj):
-            #     # Calculate and print distance to target
-            #     target_link_idx = robot.links.names.index(target_link_name)
-            #     current_fk = robot.forward_kinematics(sol_traj[traj_index])
-            #     current_pos = current_fk[target_link_idx][4:]
-            #     target_pos = np.array(ik_target_handle.position)
-            #     distance = np.linalg.norm(current_pos - target_pos)
-            #     print(f'Step {traj_index}/{len(sol_traj)}: {distance=:.6f}')
-            #     print(f'{sol_traj[traj_index]=}')
-            #     update_robot_visualization(
-            #         urdf_vis, slider_handles, robot, robot_coll, server, sol_traj[traj_index]
-            #     )
-            #     traj_index += 1
             if traj_index < len(qs_sample):
                 # Calculate and print distance to target
                 target_link_idx = robot.links.names.index(target_link_name)

@@ -16,7 +16,7 @@ Constraints:
 
 import numpy as np
 import matplotlib.pyplot as plt
-from ruckig import InputParameter, Trajectory, Result, Ruckig
+# from ruckig import InputParameter, Trajectory, Result, Ruckig
 
 
 def time_parameterize_toppra(
@@ -102,144 +102,144 @@ def time_parameterize_toppra(
     return ts_sample, qs_sample, qds_sample, qdds_sample
 
 
-def adjust_segment_with_ruckig(
-    ts_input: np.ndarray,
-    qs_input: np.ndarray,
-    qds_input: np.ndarray,
-    qdds_input: np.ndarray,
-    segment_type: str,  # 'initial' or 'final'
-    max_velocity: float = 3.14,
-    max_acceleration: float = 800.0 * np.pi / 180.0,
-    max_jerk: float = 10000.0 * np.pi / 180.0,
-    dt: float = 0.01,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Adjust trajectory segment to have zero acceleration using Ruckig.
+# def adjust_segment_with_ruckig(
+#     ts_input: np.ndarray,
+#     qs_input: np.ndarray,
+#     qds_input: np.ndarray,
+#     qdds_input: np.ndarray,
+#     segment_type: str,  # 'initial' or 'final'
+#     max_velocity: float = 3.14,
+#     max_acceleration: float = 800.0 * np.pi / 180.0,
+#     max_jerk: float = 10000.0 * np.pi / 180.0,
+#     dt: float = 0.01,
+# ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+#     """
+#     Adjust trajectory segment to have zero acceleration using Ruckig.
 
-    Args:
-        ts_input: Input time samples
-        qs_input: Input position samples
-        qds_input: Input velocity samples
-        qdds_input: Input acceleration samples
-        segment_type: 'initial' for start segment, 'final' for end segment
-        max_velocity: Maximum joint velocity [rad/s]
-        max_acceleration: Maximum joint acceleration [rad/s^2]
-        max_jerk: Maximum joint jerk [rad/s^3]
-        dt: Sampling time [s]
+#     Args:
+#         ts_input: Input time samples
+#         qs_input: Input position samples
+#         qds_input: Input velocity samples
+#         qdds_input: Input acceleration samples
+#         segment_type: 'initial' for start segment, 'final' for end segment
+#         max_velocity: Maximum joint velocity [rad/s]
+#         max_acceleration: Maximum joint acceleration [rad/s^2]
+#         max_jerk: Maximum joint jerk [rad/s^3]
+#         dt: Sampling time [s]
 
-    Returns:
-        ts_adjusted: Adjusted time samples
-        qs_adjusted: Adjusted position samples
-        qds_adjusted: Adjusted velocity samples
-        qdds_adjusted: Adjusted acceleration samples
-    """
-    n_dof = qs_input.shape[1]
-    vel_norms = np.linalg.norm(qds_input, axis=1)
+#     Returns:
+#         ts_adjusted: Adjusted time samples
+#         qs_adjusted: Adjusted position samples
+#         qds_adjusted: Adjusted velocity samples
+#         qdds_adjusted: Adjusted acceleration samples
+#     """
+#     n_dof = qs_input.shape[1]
+#     vel_norms = np.linalg.norm(qds_input, axis=1)
 
-    if segment_type == 'initial':
-        # Find first point where velocity is significant
-        target_idx = np.argmax(vel_norms > 0.01 * max_velocity)
-        if target_idx == 0:
-            target_idx = min(10, len(ts_input) - 1)
+#     if segment_type == 'initial':
+#         # Find first point where velocity is significant
+#         target_idx = np.argmax(vel_norms > 0.01 * max_velocity)
+#         if target_idx == 0:
+#             target_idx = min(10, len(ts_input) - 1)
 
-        start_pos = qs_input[0].tolist()
-        start_vel = [0.0] * n_dof
-        start_acc = [0.0] * n_dof
-        target_pos = qs_input[target_idx].tolist()
-        target_vel = qds_input[target_idx].tolist()
-        target_acc = qdds_input[target_idx].tolist()
+#         start_pos = qs_input[0].tolist()
+#         start_vel = [0.0] * n_dof
+#         start_acc = [0.0] * n_dof
+#         target_pos = qs_input[target_idx].tolist()
+#         target_vel = qds_input[target_idx].tolist()
+#         target_acc = qdds_input[target_idx].tolist()
 
-        print(f"\n=== Ruckig Initial Acceleration Adjustment ===")
-        print(f"Adjusting from t=0 to t={ts_input[target_idx]:.3f}s (index {target_idx})")
-    else:  # 'final'
-        # Find last point with significant velocity
-        significant_vel_indices = np.where(vel_norms > 0.01 * max_velocity)[0]
-        if len(significant_vel_indices) > 0:
-            target_idx = max(0, significant_vel_indices[-1] - 10)
-        else:
-            target_idx = max(0, len(ts_input) - 10)
+#         print(f"\n=== Ruckig Initial Acceleration Adjustment ===")
+#         print(f"Adjusting from t=0 to t={ts_input[target_idx]:.3f}s (index {target_idx})")
+#     else:  # 'final'
+#         # Find last point with significant velocity
+#         significant_vel_indices = np.where(vel_norms > 0.01 * max_velocity)[0]
+#         if len(significant_vel_indices) > 0:
+#             target_idx = max(0, significant_vel_indices[-1] - 10)
+#         else:
+#             target_idx = max(0, len(ts_input) - 10)
 
-        start_pos = qs_input[target_idx].tolist()
-        start_vel = qds_input[target_idx].tolist()
-        start_acc = qdds_input[target_idx].tolist()
-        target_pos = qs_input[-1].tolist()
-        target_vel = [0.0] * n_dof
-        target_acc = [0.0] * n_dof
+#         start_pos = qs_input[target_idx].tolist()
+#         start_vel = qds_input[target_idx].tolist()
+#         start_acc = qdds_input[target_idx].tolist()
+#         target_pos = qs_input[-1].tolist()
+#         target_vel = [0.0] * n_dof
+#         target_acc = [0.0] * n_dof
 
-        print(f"\n=== Ruckig Final Acceleration Adjustment ===")
-        print(f"Adjusting from t={ts_input[target_idx]:.3f}s to end "
-              f"(index {target_idx} to {len(ts_input)-1})")
+#         print(f"\n=== Ruckig Final Acceleration Adjustment ===")
+#         print(f"Adjusting from t={ts_input[target_idx]:.3f}s to end "
+#               f"(index {target_idx} to {len(ts_input)-1})")
 
-    print(f"Start: pos={start_pos[0]:.3f}, vel={start_vel[0]:.3f}, acc={start_acc[0]:.3f}")
-    print(f"Target: pos={target_pos[0]:.3f}, vel={target_vel[0]:.3f}, acc={target_acc[0]:.3f}")
+#     print(f"Start: pos={start_pos[0]:.3f}, vel={start_vel[0]:.3f}, acc={start_acc[0]:.3f}")
+#     print(f"Target: pos={target_pos[0]:.3f}, vel={target_vel[0]:.3f}, acc={target_acc[0]:.3f}")
 
-    # Initialize Ruckig
-    ruckig = Ruckig(n_dof, dt)
-    inp = InputParameter(n_dof)
-    traj = Trajectory(n_dof)
+#     # Initialize Ruckig
+#     ruckig = Ruckig(n_dof, dt)
+#     inp = InputParameter(n_dof)
+#     traj = Trajectory(n_dof)
 
-    # Set constraints
-    inp.max_velocity = [max_velocity] * n_dof
-    inp.max_acceleration = [max_acceleration] * n_dof
-    inp.max_jerk = [max_jerk] * n_dof
+#     # Set constraints
+#     inp.max_velocity = [max_velocity] * n_dof
+#     inp.max_acceleration = [max_acceleration] * n_dof
+#     inp.max_jerk = [max_jerk] * n_dof
 
-    # Set initial and target states
-    inp.current_position = start_pos
-    inp.current_velocity = start_vel
-    inp.current_acceleration = start_acc
-    inp.target_position = target_pos
-    inp.target_velocity = target_vel
-    inp.target_acceleration = target_acc
+#     # Set initial and target states
+#     inp.current_position = start_pos
+#     inp.current_velocity = start_vel
+#     inp.current_acceleration = start_acc
+#     inp.target_position = target_pos
+#     inp.target_velocity = target_vel
+#     inp.target_acceleration = target_acc
 
-    # Calculate Ruckig trajectory
-    result = ruckig.calculate(inp, traj)
+#     # Calculate Ruckig trajectory
+#     result = ruckig.calculate(inp, traj)
 
-    if result not in (Result.Working, Result.Finished):
-        print(f"Ruckig {segment_type} adjustment failed: {result}")
-        print(f"Using original trajectory without {segment_type} adjustment")
-        return ts_input, qs_input, qds_input, qdds_input
+#     if result not in (Result.Working, Result.Finished):
+#         print(f"Ruckig {segment_type} adjustment failed: {result}")
+#         print(f"Using original trajectory without {segment_type} adjustment")
+#         return ts_input, qs_input, qds_input, qdds_input
 
-    ruckig_duration = traj.duration
-    n_ruckig_samples = int(ruckig_duration / dt) + 1
+#     ruckig_duration = traj.duration
+#     n_ruckig_samples = int(ruckig_duration / dt) + 1
 
-    print(f"Ruckig {segment_type} segment duration: {ruckig_duration:.3f}s ({n_ruckig_samples} samples)")
+#     print(f"Ruckig {segment_type} segment duration: {ruckig_duration:.3f}s ({n_ruckig_samples} samples)")
 
-    # Sample Ruckig trajectory
-    ts_ruckig = np.linspace(0, ruckig_duration, n_ruckig_samples)
-    qs_ruckig = []
-    qds_ruckig = []
-    qdds_ruckig = []
+#     # Sample Ruckig trajectory
+#     ts_ruckig = np.linspace(0, ruckig_duration, n_ruckig_samples)
+#     qs_ruckig = []
+#     qds_ruckig = []
+#     qdds_ruckig = []
 
-    for t in ts_ruckig:
-        pos, vel, acc = traj.at_time(t)
-        qs_ruckig.append(pos)
-        qds_ruckig.append(vel)
-        qdds_ruckig.append(acc)
+#     for t in ts_ruckig:
+#         pos, vel, acc = traj.at_time(t)
+#         qs_ruckig.append(pos)
+#         qds_ruckig.append(vel)
+#         qdds_ruckig.append(acc)
 
-    qs_ruckig = np.array(qs_ruckig)
-    qds_ruckig = np.array(qds_ruckig)
-    qdds_ruckig = np.array(qdds_ruckig)
+#     qs_ruckig = np.array(qs_ruckig)
+#     qds_ruckig = np.array(qds_ruckig)
+#     qdds_ruckig = np.array(qdds_ruckig)
 
-    # Concatenate segments
-    if segment_type == 'initial':
-        ts_remaining = ts_input[target_idx:] - ts_input[target_idx] + ruckig_duration
-        ts_adjusted = np.concatenate([ts_ruckig, ts_remaining])
-        qs_adjusted = np.vstack([qs_ruckig, qs_input[target_idx:]])
-        qds_adjusted = np.vstack([qds_ruckig, qds_input[target_idx:]])
-        qdds_adjusted = np.vstack([qdds_ruckig, qdds_input[target_idx:]])
-    else:  # 'final'
-        ts_start_time = ts_input[target_idx]
-        ts_ruckig_adjusted = ts_ruckig + ts_start_time
-        ts_adjusted = np.concatenate([ts_input[:target_idx], ts_ruckig_adjusted])
-        qs_adjusted = np.vstack([qs_input[:target_idx], qs_ruckig])
-        qds_adjusted = np.vstack([qds_input[:target_idx], qds_ruckig])
-        qdds_adjusted = np.vstack([qdds_input[:target_idx], qdds_ruckig])
+#     # Concatenate segments
+#     if segment_type == 'initial':
+#         ts_remaining = ts_input[target_idx:] - ts_input[target_idx] + ruckig_duration
+#         ts_adjusted = np.concatenate([ts_ruckig, ts_remaining])
+#         qs_adjusted = np.vstack([qs_ruckig, qs_input[target_idx:]])
+#         qds_adjusted = np.vstack([qds_ruckig, qds_input[target_idx:]])
+#         qdds_adjusted = np.vstack([qdds_ruckig, qdds_input[target_idx:]])
+#     else:  # 'final'
+#         ts_start_time = ts_input[target_idx]
+#         ts_ruckig_adjusted = ts_ruckig + ts_start_time
+#         ts_adjusted = np.concatenate([ts_input[:target_idx], ts_ruckig_adjusted])
+#         qs_adjusted = np.vstack([qs_input[:target_idx], qs_ruckig])
+#         qds_adjusted = np.vstack([qds_input[:target_idx], qds_ruckig])
+#         qdds_adjusted = np.vstack([qdds_input[:target_idx], qdds_ruckig])
 
-    print(f"Adjusted trajectory: {len(ts_adjusted)} samples, {ts_adjusted[-1]:.3f}s total")
-    print(f"Start acceleration: {qdds_adjusted[0]}")
-    print(f"End acceleration: {qdds_adjusted[-1]}")
+#     print(f"Adjusted trajectory: {len(ts_adjusted)} samples, {ts_adjusted[-1]:.3f}s total")
+#     print(f"Start acceleration: {qdds_adjusted[0]}")
+#     print(f"End acceleration: {qdds_adjusted[-1]}")
 
-    return ts_adjusted, qs_adjusted, qds_adjusted, qdds_adjusted
+#     return ts_adjusted, qs_adjusted, qds_adjusted, qdds_adjusted
 
 
 def plot_trajectory(
@@ -345,39 +345,40 @@ def main():
 
     # Step 1: Apply TOPPRA time parameterization
     print("\n=== Step 1: TOPPRA Time Parameterization ===")
-    ts_toppra, qs_toppra, qds_toppra, qdds_toppra = time_parameterize_toppra(
+    # ts_toppra, qs_toppra, qds_toppra, qdds_toppra = time_parameterize_toppra(
+    ts_sample, qs_sample, qds_sample, qdds_sample =  time_parameterize_toppra(
         waypoints=waypoints,
         max_velocity=max_velocity,
         max_acceleration=max_acceleration,
     )
 
-    if ts_toppra is None:
-        print("TOPPRA failed!")
-        return
+    # if ts_toppra is None:
+    #     print("TOPPRA failed!")
+    #     return
 
-    # Step 2: Adjust initial acceleration to zero using Ruckig
-    print("\n=== Step 2: Ruckig Initial Adjustment ===")
-    ts_adjusted, qs_adjusted, qds_adjusted, qdds_adjusted = adjust_segment_with_ruckig(
-        ts_toppra, qs_toppra, qds_toppra, qdds_toppra,
-        segment_type='initial',
-        max_velocity=max_velocity,
-        max_acceleration=max_acceleration,
-        max_jerk=max_jerk,
-    )
+    # # Step 2: Adjust initial acceleration to zero using Ruckig
+    # print("\n=== Step 2: Ruckig Initial Adjustment ===")
+    # ts_adjusted, qs_adjusted, qds_adjusted, qdds_adjusted = adjust_segment_with_ruckig(
+    #     ts_toppra, qs_toppra, qds_toppra, qdds_toppra,
+    #     segment_type='initial',
+    #     max_velocity=max_velocity,
+    #     max_acceleration=max_acceleration,
+    #     max_jerk=max_jerk,
+    # )
 
-    if ts_adjusted is None:
-        print("Initial adjustment failed!")
-        return
+    # if ts_adjusted is None:
+    #     print("Initial adjustment failed!")
+    #     return
 
-    # Step 3: Adjust final acceleration to zero using Ruckig
-    print("\n=== Step 3: Ruckig Final Adjustment ===")
-    ts_sample, qs_sample, qds_sample, qdds_sample = adjust_segment_with_ruckig(
-        ts_adjusted, qs_adjusted, qds_adjusted, qdds_adjusted,
-        segment_type='final',
-        max_velocity=max_velocity,
-        max_acceleration=max_acceleration,
-        max_jerk=max_jerk,
-    )
+    # # Step 3: Adjust final acceleration to zero using Ruckig
+    # print("\n=== Step 3: Ruckig Final Adjustment ===")
+    # ts_sample, qs_sample, qds_sample, qdds_sample = adjust_segment_with_ruckig(
+    #     ts_adjusted, qs_adjusted, qds_adjusted, qdds_adjusted,
+    #     segment_type='final',
+    #     max_velocity=max_velocity,
+    #     max_acceleration=max_acceleration,
+    #     max_jerk=max_jerk,
+    # )
 
     if ts_sample is None:
         print("Final adjustment failed!")

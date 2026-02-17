@@ -276,9 +276,9 @@ def main():
             weight_pose_smoothness = server.gui.add_slider(
                 label="Pose Smoothness",
                 min=0.0,
-                max=10.0,
+                max=100.0,
                 step=0.1,
-                initial_value=4.1,
+                initial_value=10.0,
             )
             weight_match_start_pose = server.gui.add_slider(
                 label="Match Start Pose",
@@ -345,7 +345,7 @@ def main():
                 min=0.0,
                 max=100.0,
                 step=1.0,
-                initial_value=9.0,
+                initial_value=21.0,
             )
 
     sol_traj = np.array(
@@ -415,7 +415,7 @@ def main():
     )
     time_step.on_update(  # When sliders move, we update the URDF configuration.
         lambda _:  urdf_vis_mc.update_cfg(
-            np.array([value for value in qs_sample[time_step.value]])
+            np.array([value for value in sol_traj[time_step.value]])
         )
     )
 

@@ -26,19 +26,19 @@ import toppra as ta
 import toppra.constraint as constraint
 import toppra.algorithm as algo
 
-# # Enable JAX persistent compilation cache
-# # Use a permanent directory (not /tmp which is cleared on reboot)
-# os.environ["JAX_COMPILATION_CACHE_DIR"] = str(Path.home() / ".cache" / "jax")
-# os.environ["JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES"] = "-1"
-# os.environ["JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS"] = "0"
+# Enable JAX persistent compilation cache
+# Use a permanent directory (not /tmp which is cleared on reboot)
+os.environ["JAX_COMPILATION_CACHE_DIR"] = str(Path.home() / ".cache" / "jax")
+os.environ["JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES"] = "-1"
+os.environ["JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS"] = "0"
 
 
-# # Enable JAX persistent compilation cache
-# os.environ["JAX_COMPILATION_CACHE_DIR"] = "/tmp/jax_cache"
-# # JAX 0.7+ uses different config names
-# jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
-# jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
-# jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+# Enable JAX persistent compilation cache
+os.environ["JAX_COMPILATION_CACHE_DIR"] = "/tmp/jax_cache"
+# JAX 0.7+ uses different config names
+jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
+jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 
 
 def create_robot_control_sliders(
@@ -193,7 +193,7 @@ def main():
     )
 
     # Define the online planning parameters.
-    len_traj, dt = 10, 0.1
+    len_traj, dt = 10, 0.3
 
     # Set up visualizer.
     server = viser.ViserServer()
@@ -267,7 +267,7 @@ def main():
                 min=0.0,
                 max=10.0,
                 step=0.1,
-                initial_value=3.0,
+                initial_value=4.1,
             )
             weight_match_start_pose = server.gui.add_slider(
                 label="Match Start Pose",
@@ -297,7 +297,7 @@ def main():
                 min=0.0,
                 max=10.0,
                 step=0.1,
-                initial_value=1.0,
+                initial_value=0.0,
             )
             weight_limit = server.gui.add_slider(
                 label="Joint Limit",
@@ -311,14 +311,14 @@ def main():
                 min=0.0,
                 max=1.0,
                 step=0.01,
-                initial_value=0.01,
+                initial_value=0.0,
             )
             weight_manipulability = server.gui.add_slider(
                 label="Manipulability",
                 min=0.0,
                 max=1.0,
                 step=0.01,
-                initial_value=0.01,
+                initial_value=0.0,
             )
 
         with server.gui.add_folder("Collision Costs"):
@@ -334,7 +334,7 @@ def main():
                 min=0.0,
                 max=100.0,
                 step=1.0,
-                initial_value=10.0,
+                initial_value=9.0,
             )
 
     # speed_percentage = server.gui.add_slider(
@@ -379,7 +379,7 @@ def main():
     qs_sample = sol_traj.copy()
     # sol_traj_init = np.array([current_cfg] * len_traj)
 
-    is_executing = False
+    is_executing = True
     traj_index = 0
 
     plan_button = server.gui.add_button(
@@ -408,6 +408,34 @@ def main():
         )
     )
 
+    """Callback when IK target is updated. warm up"""
+    box_coll_world_current = box_spheres.transform_from_wxyz_position(
+        wxyz=np.array(box_handle.wxyz),
+        position=np.array(box_handle.position),
+    )
+    world_coll_list = [plane_coll, box_coll_world_current]
+    weights = np.ones(len(world_coll_list)) * collision_weight.value
+    rest_weights = np.array([rest_weight.value] * robot.joints.num_actuated_joints)
+    rest_weights[0] = 0  # allow joint rotation intensly
+    if realtime_ik.value:
+        # Realtime IK mode
+        ik_sol = pks.solve_ik_with_collision_custom(
+            robot=robot,
+            coll=robot_coll,
+            world_coll_list=world_coll_list,
+            target_link_name=target_link_name,
+            target_position=np.array(ik_target_handle.position),
+            target_wxyz=np.array(ik_target_handle.wxyz),
+            weights=weights,
+            pose_weight=pose_weight.value,
+            rest_weight=rest_weights,
+            initial_joint_angles=current_mc_cfg,
+            elbow_height_weight=elbow_height_weight.value,
+            elbow_link_name='forearm_link',
+        )
+        urdf_vis_mc.update_cfg(ik_sol)
+        current_mc_cfg = ik_sol.copy()
+
     @ik_target_handle.on_update
     def _(_: viser.TransformControlsHandle) -> None:
         nonlocal current_mc_cfg
@@ -422,22 +450,27 @@ def main():
         rest_weights[0] = 0  # allow joint rotation intensly
         if realtime_ik.value:
             # Realtime IK mode
-            ik_sol = pks.solve_ik_with_collision_custom(
-                robot=robot,
-                coll=robot_coll,
-                world_coll_list=world_coll_list,
-                target_link_name=target_link_name,
-                target_position=np.array(ik_target_handle.position),
-                target_wxyz=np.array(ik_target_handle.wxyz),
-                weights=weights,
-                pose_weight=pose_weight.value,
-                rest_weight=rest_weights,
-                initial_joint_angles=current_mc_cfg,
-                elbow_height_weight=elbow_height_weight.value,
-                elbow_link_name='forearm_link',
-            )
-            urdf_vis_mc.update_cfg(ik_sol)
-            current_mc_cfg = ik_sol.copy()
+            try:
+                ik_sol = pks.solve_ik_with_collision_custom(
+                    robot=robot,
+                    coll=robot_coll,
+                    world_coll_list=world_coll_list,
+                    target_link_name=target_link_name,
+                    target_position=np.array(ik_target_handle.position),
+                    target_wxyz=np.array(ik_target_handle.wxyz),
+                    weights=weights,
+                    pose_weight=pose_weight.value,
+                    rest_weight=rest_weights,
+                    initial_joint_angles=current_mc_cfg,
+                    elbow_height_weight=elbow_height_weight.value,
+                    elbow_link_name='forearm_link',
+                )
+                urdf_vis_mc.update_cfg(ik_sol)
+                current_mc_cfg = ik_sol.copy()
+            except (ValueError, RuntimeError) as e:
+                print(f"IK solver failed: {e}")
+                print("Keeping previous configuration")
+                # Keep current_mc_cfg unchanged
 
     while True:
         # Offline execution mode
