@@ -366,16 +366,29 @@ class RobotCollision:
             The collision geometry (CollGeom) transformed to the world frame
             according to the provided configuration.
         """
-        # Check if the link names match - this should be true if both Robot
-        # and RobotCollision were created from the same URDF parser results.
-        assert self.link_names == robot.links.names, (
-            "Link name mismatch between RobotCollision and Robot kinematics."
-        )
+        # Check if robot links are a prefix of collision links
+        # (allows for attached links beyond the original robot)
+        robot_link_count = len(robot.links.names)
+        if self.num_links < robot_link_count:
+            raise ValueError(
+                f"RobotCollision has fewer links ({self.num_links}) than "
+                f"Robot ({robot_link_count})"
+            )
+
+        # Validate that robot's links match the beginning of collision links
+        for i, robot_link_name in enumerate(robot.links.names):
+            if self.link_names[i] != robot_link_name:
+                raise ValueError(
+                    f"Link mismatch at index {i}: "
+                    f"Robot has '{robot_link_name}', "
+                    f"RobotCollision has '{self.link_names[i]}'"
+                )
 
         Ts_link_world_wxyz_xyz = robot.forward_kinematics(cfg)
         Ts_link_world = jaxlie.SE3(Ts_link_world_wxyz_xyz)
 
         # Index FK transforms by link for each geometry
+        # Attached link geometries use their parent link's index in _geom_to_link_idx
         Ts_per_geom = jaxlie.SE3(Ts_link_world.wxyz_xyz[..., self._geom_to_link_idx, :])
         return self.coll.transform(Ts_per_geom)
 
@@ -552,3 +565,131 @@ class RobotCollision:
         )
 
         return dist_matrix
+
+
+    def attach_link(
+        self,
+        new_link_name: str,
+        parent_link_name: str,
+        spheres: Sphere,
+        ignore_self_collision: bool = False,
+        offset: jaxlie.SE3 | None = None,
+    ) -> "RobotCollision":
+        """
+        Attach a new link with collision spheres to an existing parent link.
+
+        Args:
+            new_link_name: Name for the new link to create.
+            parent_link_name: Name of the existing link to attach to.
+            spheres: Sphere collision geometry for the new link (in parent link's local frame).
+            ignore_self_collision: If True, ignore collisions between new link and parent.
+            offset: SE3 transformation offset from parent link frame to new link frame.
+                    If None, spheres are used as-is in parent's local frame.
+
+        Returns:
+            New RobotCollision instance with the attached link.
+        """
+        # Validate inputs
+        if parent_link_name not in self.link_names:
+            raise ValueError(
+                f"Parent link '{parent_link_name}' not found. "
+                f"Available: {self.link_names}"
+            )
+
+        if new_link_name in self.link_names:
+            raise ValueError(f"Link '{new_link_name}' already exists")
+
+        if not isinstance(spheres, Sphere):
+            raise TypeError(f"Expected Sphere, got {type(spheres)}")
+
+        if not isinstance(self.coll, Sphere):
+            raise NotImplementedError(
+                "attach_link only supports Sphere-based RobotCollision"
+            )
+
+        # Get indices
+        parent_link_idx = self.link_names.index(parent_link_name)
+        new_link_idx = self.num_links
+
+        # Apply offset if provided
+        if offset is not None:
+            spheres = spheres.transform(offset)
+
+        # Get number of new spheres
+        sphere_axes = spheres.get_batch_axes()
+        if len(sphere_axes) == 0:
+            n_new_spheres = 1
+            spheres = spheres.broadcast_to((1,))
+        else:
+            n_new_spheres = sphere_axes[0]
+
+        # Concatenate collision geometry
+        new_coll = Sphere(
+            pose=jaxlie.SE3(
+                jnp.concatenate(
+                    [self.coll.pose.wxyz_xyz, spheres.pose.wxyz_xyz], axis=0
+                )
+            ),
+            size=jnp.concatenate([self.coll.size, spheres.size], axis=0),
+        )
+
+        # Update link names
+        new_link_names = self.link_names + (new_link_name,)
+
+        # Update geom-to-link mapping
+        # Important: attached link geometries use parent link's FK transform
+        new_geom_to_link = jnp.concatenate([
+            self._geom_to_link_idx,
+            jnp.full(n_new_spheres, parent_link_idx, dtype=jnp.int32)
+        ])
+
+        # Compute geometry counts per link
+        n_existing_geoms = len(self._geom_to_link_idx)
+        geom_counts = onp.zeros(self.num_links + 1, dtype=onp.int32)
+        for geom_idx in range(n_existing_geoms):
+            link_idx = int(self._geom_to_link_idx[geom_idx])
+            geom_counts[link_idx] += 1
+        geom_counts[new_link_idx] = n_new_spheres
+
+        # Compute offsets
+        geom_offsets = onp.zeros(self.num_links + 2, dtype=onp.int32)
+        geom_offsets[1:] = onp.cumsum(geom_counts)
+
+        # Build new collision pairs
+        new_idx_i = list(self.active_idx_i)
+        new_idx_j = list(self.active_idx_j)
+
+        # Add pairs: new link vs existing links
+        for existing_link_idx in range(self.num_links):
+            # Skip parent if ignore_self_collision
+            if ignore_self_collision and existing_link_idx == parent_link_idx:
+                continue
+
+            # Pair all geometries
+            for new_gi in range(n_new_spheres):
+                new_geom_idx = geom_offsets[new_link_idx] + new_gi
+                for existing_gi in range(geom_counts[existing_link_idx]):
+                    existing_geom_idx = (
+                        geom_offsets[existing_link_idx] + existing_gi
+                    )
+                    # Smaller index first
+                    if existing_geom_idx < new_geom_idx:
+                        new_idx_i.append(existing_geom_idx)
+                        new_idx_j.append(new_geom_idx)
+                    else:
+                        new_idx_i.append(new_geom_idx)
+                        new_idx_j.append(existing_geom_idx)
+
+        logger.info(
+            f"Attached '{new_link_name}' to '{parent_link_name}': "
+            f"{n_new_spheres} spheres, {len(new_idx_i)} total pairs"
+        )
+
+        return RobotCollision(
+            num_links=self.num_links + 1,
+            link_names=new_link_names,
+            coll=new_coll,
+            active_idx_i=tuple(new_idx_i),
+            active_idx_j=tuple(new_idx_j),
+            _geom_to_link_idx=new_geom_to_link,
+        )

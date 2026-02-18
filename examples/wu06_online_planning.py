@@ -3,7 +3,6 @@
 Run online planning in collision aware environments.
 """
 
-import jax
 from wutility import voxel_fit_volume_sample_surface_mesh
 from wutility import sample_even_fit_mesh
 from viser.extras import ViserUrdf
@@ -36,10 +35,14 @@ os.environ["JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS"] = "0"
 # Enable JAX persistent compilation cache
 os.environ["JAX_COMPILATION_CACHE_DIR"] = "/tmp/jax_cache"
 # JAX 0.7+ uses different config names
+import jax
 jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
 jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
 jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 
+
+NUM_OBJECT_SPHERES = 100
+NUM_HAND_SPHERES = 100
 
 def create_robot_control_sliders(
     server: viser.ViserServer, viser_urdf: ViserUrdf
@@ -164,6 +167,15 @@ def time_parameterize_toppra(
     return ts_sample, qs_sample, qds_sample, qdds_sample
 
 
+def spherelize_mesh(mesh: trimesh.Trimesh, n_spheres=500,
+                    sphere_radius=0.005) -> pk.collision.Sphere:
+    pts, radius = sample_even_fit_mesh(mesh, n_spheres=n_spheres,
+                                       sphere_radius=sphere_radius)
+    spheres = pk.collision.Sphere.from_center_and_radius(
+        center=pts, radius=radius)
+    return spheres
+
+
 def main():
     """Main function for online planning with collision."""
     # urdf = load_robot_description("panda_description")
@@ -181,6 +193,19 @@ def main():
     robot_coll = pk.collision.RobotCollision.from_sphere_decomposition(
         sphere_decomposition=sphere_decomposition,
         urdf=urdf,
+    )
+    hand_mesh = trimesh.load_mesh(
+        str(Path(__file__).parent / '../cad/robotiq_2F_adaptive_gripper_rough.STL'))
+    hand_mesh.apply_scale(0.001)
+    sphere_hand_mesh = spherelize_mesh(
+        hand_mesh, n_spheres=NUM_HAND_SPHERES, sphere_radius=0.002)
+
+    # Attach hand as a new link to tool0
+    robot_coll = robot_coll.attach_link(
+        new_link_name='hand_gripper',
+        parent_link_name='tool0',
+        spheres=sphere_hand_mesh,
+        ignore_self_collision=True,  # Ignore collision between hand and tool0
     )
     # For UR5 it's important to initialize the robot in a safe configuration;
     # the zero-configuration puts the robot aligned with the wall obstacle.
@@ -265,9 +290,9 @@ def main():
             weight_pose_smoothness = server.gui.add_slider(
                 label="Pose Smoothness",
                 min=0.0,
-                max=10.0,
+                max=100.0,
                 step=0.1,
-                initial_value=4.1,
+                initial_value=10.0,
             )
             weight_match_start_pose = server.gui.add_slider(
                 label="Match Start Pose",
@@ -334,7 +359,7 @@ def main():
                 min=0.0,
                 max=100.0,
                 step=1.0,
-                initial_value=9.0,
+                initial_value=21.0,
             )
 
     # speed_percentage = server.gui.add_slider(
