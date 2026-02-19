@@ -693,3 +693,124 @@ class RobotCollision:
             active_idx_j=tuple(new_idx_j),
             _geom_to_link_idx=new_geom_to_link,
         )
+
+
+    def detach_link(
+        self,
+        link_name: str,
+        num_geoms: int | None = None,
+    ) -> "RobotCollision":
+        """
+        Detach (remove) a link from the collision model.
+
+        Note: Currently only supports detaching the most recently attached link.
+
+        Args:
+            link_name: Name of the link to remove.
+            num_geoms: Number of geometries to remove. If None, will attempt to
+                      infer from collision structure (may fail for complex cases).
+
+        Returns:
+            New RobotCollision instance without the detached link.
+        """
+        # Validate link exists
+        if link_name not in self.link_names:
+            raise ValueError(
+                f"Link '{link_name}' not found. Available: {self.link_names}"
+            )
+
+        if not isinstance(self.coll, Sphere):
+            raise NotImplementedError(
+                "detach_link only supports Sphere-based RobotCollision"
+            )
+
+        # Get link index to remove
+        link_idx_to_remove = self.link_names.index(link_name)
+
+        # Currently only support removing the last link (most recently attached)
+        if link_idx_to_remove != self.num_links - 1:
+            raise NotImplementedError(
+                f"Currently only supports detaching the last link. "
+                f"'{link_name}' is at index {link_idx_to_remove}, "
+                f"but last link is '{self.link_names[-1]}' at index {self.num_links - 1}"
+            )
+
+        # For the last (attached) link, we need to find how many geometries were added
+        if num_geoms is not None:
+            # User explicitly specified the number of geometries to remove
+            n_geoms_to_remove = num_geoms
+            n_geoms_to_keep = len(self._geom_to_link_idx) - n_geoms_to_remove
+        else:
+            # Try to infer from collision structure
+            # Strategy: In attach_link, new geometries are appended to the end.
+            # We need to find where the original geometries end.
+
+            # Try to find boundary: largest index N where all pairs with indices <= N
+            # only reference indices <= N (i.e., no pairs crossing the boundary)
+            n_geoms_to_keep = 0
+            for candidate_n in range(1, len(self._geom_to_link_idx) + 1):
+                # Check if there are pairs crossing this boundary
+                pairs_crossing = [(i, j) for i, j in zip(self.active_idx_i, self.active_idx_j)
+                                 if (i < candidate_n) != (j < candidate_n)]
+
+                # If we find a boundary where pairs don't cross, that's likely the split
+                if len(pairs_crossing) > 0 and n_geoms_to_keep == 0:
+                    # First time we see crossing pairs, the previous candidate was the boundary
+                    n_geoms_to_keep = candidate_n - 1
+                    break
+
+            # Fallback: if no clear boundary, cannot infer
+            if n_geoms_to_keep == 0:
+                # This means no clear split found or all geometries are interconnected
+                raise RuntimeError(
+                    "Cannot automatically determine geometry boundary for detachment. "
+                    "Please specify num_geoms parameter explicitly. "
+                    f"Total geometries: {len(self._geom_to_link_idx)}, "
+                    f"num_links: {self.num_links}"
+                )
+
+            n_geoms_to_remove = len(self._geom_to_link_idx) - n_geoms_to_keep
+
+        if n_geoms_to_keep == 0:
+            raise ValueError("Cannot remove all geometries from RobotCollision")
+
+        # Keep first n_geoms_to_keep geometries
+        geom_indices_to_keep = jnp.arange(n_geoms_to_keep)
+
+        # Filter collision geometry
+        new_coll = Sphere(
+            pose=jaxlie.SE3(self.coll.pose.wxyz_xyz[geom_indices_to_keep]),
+            size=self.coll.size[geom_indices_to_keep],
+        )
+
+        # Update link names (remove the detached link)
+        new_link_names = self.link_names[:-1]
+
+        # Update geom-to-link mapping (just keep first n_geoms_to_keep)
+        new_geom_to_link = self._geom_to_link_idx[geom_indices_to_keep]
+
+        # Filter collision pairs: remove pairs involving removed geometries
+        new_idx_i = []
+        new_idx_j = []
+
+        for old_i, old_j in zip(self.active_idx_i, self.active_idx_j):
+            # Keep pair only if both indices are within kept geometries
+            if old_i < n_geoms_to_keep and old_j < n_geoms_to_keep:
+                new_idx_i.append(old_i)
+                new_idx_j.append(old_j)
+
+        logger.info(
+            f"Detached '{link_name}': "
+            f"removed {n_geoms_to_remove} geometries, "
+            f"{n_geoms_to_keep} geometries remaining, "
+            f"{len(new_idx_i)} collision pairs (was {len(self.active_idx_i)})"
+        )
+
+        return RobotCollision(
+            num_links=self.num_links - 1,
+            link_names=new_link_names,
+            coll=new_coll,
+            active_idx_i=tuple(new_idx_i),
+            active_idx_j=tuple(new_idx_j),
+            _geom_to_link_idx=new_geom_to_link,
+        )

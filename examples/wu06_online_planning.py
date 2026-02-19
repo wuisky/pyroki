@@ -171,6 +171,23 @@ def spherelize_mesh(mesh: trimesh.Trimesh, n_spheres=500,
                     sphere_radius=0.005) -> pk.collision.Sphere:
     pts, radius = sample_even_fit_mesh(mesh, n_spheres=n_spheres,
                                        sphere_radius=sphere_radius)
+
+    actual_n_spheres = len(pts)
+    print(f"Created {actual_n_spheres} spheres from mesh (requested: {n_spheres})")
+
+    # Pad with radius=0 spheres if we have fewer than requested
+    if actual_n_spheres < n_spheres:
+        n_padding = n_spheres - actual_n_spheres
+        print(f"Padding with {n_padding} zero-radius spheres")
+
+        # Create padding spheres at origin with radius 0
+        padding_pts = np.zeros((n_padding, 3))
+        padding_radius = np.zeros(n_padding)
+
+        # Concatenate original and padding spheres
+        pts = np.concatenate([pts, padding_pts], axis=0)
+        radius = np.concatenate([radius, padding_radius], axis=0)
+
     spheres = pk.collision.Sphere.from_center_and_radius(
         center=pts, radius=radius)
     return spheres
@@ -207,6 +224,7 @@ def main():
         spheres=sphere_hand_mesh,
         ignore_self_collision=True,  # Ignore collision between hand and tool0
     )
+    robot_coll = robot_coll.detach_link('hand_gripper', num_geoms=NUM_HAND_SPHERES)
     # For UR5 it's important to initialize the robot in a safe configuration;
     # the zero-configuration puts the robot aligned with the wall obstacle.
     # default_cfg = np.array([0, -1.57, 0, -1.57, 0, 0])
