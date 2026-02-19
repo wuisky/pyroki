@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<robot name="one_link_gripper">
+
+  <link name="gripper_link">
+    <!-- Visual: local STL -->
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="robotiq_2F_adaptive_gripper_rough.STL" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <!-- optional -->
+      <material name="gray">
+        <color rgba="0.7 0.7 0.7 1.0"/>
+      </material>
+    </visual>
+
+    <!-- Optional collision: same mesh (can be heavy) -->
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="robotiq_2F_adaptive_gripper_rough.STL" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+
+    <!-- Minimal inertial (replace with real values if you have them) -->
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="1.0"/>
+      <inertia ixx="0.001" ixy="0.0" ixz="0.0" iyy="0.001" iyz="0.0" izz="0.001"/>
+    </inertial>
+  </link>
+
+</robot>
