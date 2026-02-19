@@ -193,6 +193,104 @@ def spherelize_mesh(mesh: trimesh.Trimesh, n_spheres=500,
     return spheres
 
 
+def load_spheres_from_json(json_path: str | Path, link_name: str | None = None,
+                           n_spheres: int | None = None) -> pk.collision.Sphere:
+    """
+    Load sphere collision geometry from a JSON file.
+
+    Args:
+        json_path: Path to the JSON file containing sphere decomposition.
+        link_name: Name of the link to load. If None, loads the first (or only) link.
+        n_spheres: If specified, pads with zero-radius spheres to reach this count.
+
+    Returns:
+        Sphere collision geometry.
+    """
+    with open(json_path, "r") as f:
+        sphere_data = json.load(f)
+
+    # Get the link data
+    if link_name is None:
+        # Use the first link in the file
+        if len(sphere_data) == 0:
+            raise ValueError(f"No links found in {json_path}")
+        link_name = list(sphere_data.keys())[0]
+        link_data = sphere_data[link_name]
+    else:
+        if link_name not in sphere_data:
+            raise ValueError(
+                f"Link '{link_name}' not found in {json_path}. "
+                f"Available: {list(sphere_data.keys())}"
+            )
+        link_data = sphere_data[link_name]
+
+    # Extract centers and radii
+    centers = np.array(link_data["centers"])
+    radii = np.array(link_data["radii"])
+
+    actual_n_spheres = len(centers)
+    print(f"Loaded {actual_n_spheres} spheres for link '{link_name}' from {Path(json_path).name}")
+
+    # Pad with zero-radius spheres if requested
+    if n_spheres is not None and actual_n_spheres < n_spheres:
+        n_padding = n_spheres - actual_n_spheres
+        print(f"Padding with {n_padding} zero-radius spheres")
+
+        padding_centers = np.zeros((n_padding, 3))
+        padding_radii = np.zeros(n_padding)
+
+        centers = np.concatenate([centers, padding_centers], axis=0)
+        radii = np.concatenate([radii, padding_radii], axis=0)
+
+    spheres = pk.collision.Sphere.from_center_and_radius(
+        center=centers, radius=radii)
+    return spheres
+
+
+def get_link_path_from_urdf(urdf: yourdfpy.URDF, target_link_name: str, root_node_name: str = "") -> str:
+    """
+    Get the full viser scene path to a link by traversing the URDF kinematic chain.
+
+    Args:
+        urdf: The URDF object.
+        target_link_name: Name of the target link.
+        root_node_name: Root node name prefix (e.g., "/robot_mc").
+
+    Returns:
+        Full path string (e.g., "/robot_mc/visual/base_link/.../tool0").
+    """
+    # Build parent-child map from joints
+    child_to_parent = {}
+    for joint in urdf.joint_map.values():
+        child_to_parent[joint.child] = joint.parent
+
+    # Traverse from target link back to root
+    path_parts = []
+    current_link = target_link_name
+
+    while current_link in child_to_parent:
+        path_parts.append(current_link)
+        current_link = child_to_parent[current_link]
+
+    # Add the root link (base link that has no parent)
+    path_parts.append(current_link)
+
+    # Reverse to get root -> target order
+    path_parts.reverse()
+
+    # Remove 'world' from the beginning if it exists
+    if path_parts and path_parts[0] == 'world':
+        path_parts = path_parts[1:]
+
+    # Build the viser path: root_node_name/visual/link1/link2/.../target
+    if root_node_name:
+        full_path = f"{root_node_name}/visual/" + "/".join(path_parts)
+    else:
+        full_path = "/visual/" + "/".join(path_parts)
+
+    return full_path
+
+
 def main():
     """Main function for online planning with collision."""
     # urdf = load_robot_description("panda_description")
@@ -211,11 +309,15 @@ def main():
         sphere_decomposition=sphere_decomposition,
         urdf=urdf,
     )
-    hand_mesh = trimesh.load_mesh(
-        str(Path(__file__).parent / '../cad/robotiq_2F_adaptive_gripper_rough.STL'))
-    hand_mesh.apply_scale(0.001)
-    sphere_hand_mesh = spherelize_mesh(
-        hand_mesh, n_spheres=NUM_HAND_SPHERES, sphere_radius=0.002)
+    # hand_mesh = trimesh.load_mesh(
+    #     str(Path(__file__).parent / '../cad/robotiq_2F_adaptive_gripper_rough.STL'))
+    # hand_mesh.apply_scale(0.001)
+    # sphere_hand_mesh = spherelize_mesh(
+    #     hand_mesh, n_spheres=NUM_HAND_SPHERES, sphere_radius=0.002)
+    sphere_hand_mesh = load_spheres_from_json(
+        str(Path(__file__).parent / '../cad/robotiq_2F_adaptive_gripper_rough_spherized.json'))
+    print(f'{sphere_hand_mesh.size=}')
+
 
     # Attach hand as a new link to tool0
     robot_coll = robot_coll.attach_link(
@@ -224,7 +326,9 @@ def main():
         spheres=sphere_hand_mesh,
         ignore_self_collision=True,  # Ignore collision between hand and tool0
     )
-    robot_coll = robot_coll.detach_link('hand_gripper', num_geoms=NUM_HAND_SPHERES)
+    # robot_coll = robot_coll.detach_link('hand_gripper', num_geoms=NUM_HAND_SPHERES)
+
+
     # For UR5 it's important to initialize the robot in a safe configuration;
     # the zero-configuration puts the robot aligned with the wall obstacle.
     # default_cfg = np.array([0, -1.57, 0, -1.57, 0, 0])
@@ -247,6 +351,23 @@ def main():
                             mesh_color_override=(0.3, 0.3, 0.8, 0.5))
     urdf_vis_mc.update_cfg(default_cfg)
     current_mc_cfg = default_cfg.copy()
+
+    # Add gripper mesh to the end-effector link of urdf_vis_mc
+    gripper_mesh = trimesh.load_mesh(
+        str(Path(__file__).parent / '../cad/robotiq_2F_adaptive_gripper_rough.STL'))
+    gripper_mesh.apply_scale(0.001)  # Scale to meters
+
+    # Get the full path to the target link in the viser scene
+    link_path = get_link_path_from_urdf(urdf, target_link_name, root_node_name="/robot_mc")
+    gripper_path = f"{link_path}/gripper_visual"
+    print(f"Adding gripper mesh to: {gripper_path}")
+
+    server.scene.add_mesh_trimesh(
+        gripper_path,
+        mesh=gripper_mesh,
+        wxyz=(1.0, 0.0, 0.0, 0.0),
+        position=(0.0, 0.0, 0.0),
+    )
 
     with server.gui.add_folder("Joint   position", expand_by_default=False):
         (slider_handles, initial_config) = create_robot_control_sliders(
@@ -310,7 +431,7 @@ def main():
                 min=0.0,
                 max=100.0,
                 step=0.1,
-                initial_value=10.0,
+                initial_value=30.0,
             )
             weight_match_start_pose = server.gui.add_slider(
                 label="Match Start Pose",
