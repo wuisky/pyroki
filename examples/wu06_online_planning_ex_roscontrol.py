@@ -1,106 +1,81 @@
-"""Online Planning
+"""Online Planning with ROS Control
 
-Run online planning in collision aware environments.
+Run online planning in collision aware environments with ROS2 trajectory execution.
 """
-
 
 import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
 import time
+from typing import Optional
 
 from builtin_interfaces.msg import Duration
 from control_msgs.action import FollowJointTrajectory
 import numpy as np
 import pyroki as pk
-from pyroki.collision import HalfSpace
-from pyroki.collision import RobotCollision
-from pyroki.collision import Sphere
+from pyroki.collision import HalfSpace, RobotCollision, Sphere
 import pyroki_snippets as pks
 import rclpy
 from rclpy.action import ActionClient
 from rclpy.duration import Duration as rclDuration
 from rclpy.node import Node
-from rclpy.qos import DurabilityPolicy
-from rclpy.qos import HistoryPolicy
-from rclpy.qos import QoSProfile
-from rclpy.qos import ReliabilityPolicy
-from robot_descriptions.loaders.yourdfpy import load_robot_description
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from robot_descriptions.loaders.yourdfpy import yourdfpy
-from trajectory_msgs.msg import JointTrajectory
-from trajectory_msgs.msg import JointTrajectoryPoint
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 import trimesh
+import tyro
 import viser
 from viser.extras import ViserUrdf
 from wutility import sample_even_fit_mesh
-from wutility import voxel_fit_volume_sample_surface_mesh
 from toppra_quintic_optimal import generate_optimal_trajectory
 
 # Enable JAX persistent compilation cache
-# Use a permanent directory (not /tmp which is cleared on reboot)
-os.environ["JAX_COMPILATION_CACHE_DIR"] = str(Path.home() / ".cache" / "jax")
+os.environ["JAX_COMPILATION_CACHE_DIR"] = "/tmp/jax_cache"
 os.environ["JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES"] = "-1"
 os.environ["JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS"] = "0"
-os.environ["JAX_COMPILATION_CACHE_DIR"] = "/tmp/jax_cache"
 
 import jax
-# JAX 0.7+ uses different config names
 jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
 jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
 jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 
 
-def create_robot_control_sliders(
-    server: viser.ViserServer, viser_urdf: ViserUrdf
-) -> tuple[list[viser.GuiInputHandle[float]], list[float]]:
-    """Create slider for each joint of the robot. We also update robot model
-    when slider moves."""
-    slider_handles: list[viser.GuiInputHandle[float]] = []
-    initial_config: list[float] = []
-    for joint_name, (
-        lower,
-        upper,
-    ) in viser_urdf.get_actuated_joint_limits().items():
-        lower = lower if lower is not None else -np.pi
-        upper = upper if upper is not None else np.pi
-        initial_pos = 0.0 if lower < -0.1 and upper > 0.1 else (lower + upper) / 2.0
-        slider = server.gui.add_slider(
-            label=joint_name,
-            min=lower,
-            max=upper,
-            step=1e-3,
-            initial_value=initial_pos,
-        )
-        # slider.on_update(  # When sliders move, we update the URDF configuration.
-        #     lambda _: viser_urdf.update_cfg(
-        #         np.array([slider.value for slider in slider_handles])
-        #     )
-        # )
-        slider_handles.append(slider)
-        initial_config.append(initial_pos)
-    return slider_handles, initial_config
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Config:
+    """Online planning with ROS control configuration."""
+    urdf_path: str = str(Path(__file__).parent / "../ur5e/ur5e.urdf.sphere")
+    sphere_json_path: str = str(Path(__file__).parent / "../ur5e/ur5e.urdf_spherized.json")
+    target_link_name: str = "tool0"
+    elbow_link_name: str = "forearm_link"
+    default_cfg: tuple = (-0.523, -1.61, 1.544, -1.5, -1.57, -0.5)
+    viser_port: int = 8080
+    len_traj: int = 10
+    dt: float = 0.3
+    box_stl_path: str = str(Path(__file__).parent / "storage_box.stl")
+    box_n_spheres: int = 500
+    box_sphere_radius: float = 0.005
 
 
-def update_robot_visualization(
-    urdf_vis: ViserUrdf,
-    slider_handles: list[viser.GuiInputHandle[float]],
-    robot: pk.Robot,
-    robot_coll: RobotCollision,
-    server: viser.ViserServer,
-    config: np.ndarray,
-) -> None:
-    """Update robot URDF visualization, sliders, and collision mesh."""
-    urdf_vis.update_cfg(config)
-    for slider, value in zip(slider_handles, config):
-        slider.value = float(value)
-    robot_coll_mesh = robot_coll.at_config(robot, config).to_trimesh()
-    server.scene.add_mesh_trimesh("/robot_coll", mesh=robot_coll_mesh, visible=True)
+# ---------------------------------------------------------------------------
+# ROS2 Node
+# ---------------------------------------------------------------------------
 
+class JointTrajectoryPublisher(Node):
+    """ROS2 node for sending joint trajectory commands."""
 
-class PublisherJointTrajectory(Node):
+    JOINT_NAMES = [
+        "shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint",
+        "wrist_1_joint", "wrist_2_joint", "wrist_3_joint",
+    ]
+
     def __init__(self):
         super().__init__("publisher_position_trajectory_controller")
-        action_name = '/joint_trajectory_controller/follow_joint_trajectory'
+        action_name = "/joint_trajectory_controller/follow_joint_trajectory"
         self.action_client = ActionClient(self, FollowJointTrajectory, action_name)
         qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -108,64 +83,52 @@ class PublisherJointTrajectory(Node):
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
-        self.publisher = self.create_publisher(JointTrajectory,
-                                               "/joint_trajectory_controller/joint_trajectory",
-                                               qos)
+        self.publisher = self.create_publisher(
+            JointTrajectory,
+            "/joint_trajectory_controller/joint_trajectory",
+            qos,
+        )
 
     def goal_response_callback(self, future):
         goal_handle = future.result()
         if not goal_handle.accepted:
-            self.get_logger().info('Goal rejected :(')
+            self.get_logger().info("Goal rejected :(")
             return
-
-        self.get_logger().info('Goal accepted :)')
-
+        self.get_logger().info("Goal accepted :)")
         self.get_result_future = goal_handle.get_result_async()
         self.get_result_future.add_done_callback(self.get_result_callback)
 
     def get_result_callback(self, future):
-        error_string = future.result().result.error_string
         error_code = future.result().result.error_code
+        error_string = future.result().result.error_string
         if error_code == FollowJointTrajectory.Result.SUCCESSFUL:
-            self.get_logger().info('Goal succeeded!')
+            self.get_logger().info("Goal succeeded!")
         else:
-            self.get_logger().info(f'Goal failed with error string: {error_string}')
+            self.get_logger().info(f"Goal failed: {error_string}")
 
-    def send_topic(self, joint_list):
+    def send_topic(self, joint_positions: list, duration_sec: int = 4) -> None:
+        """Send a single joint position command via topic."""
         traj = JointTrajectory()
-        # traj.joint_names = self.joints
-        traj.joint_names = [
-            'shoulder_pan_joint', 'shoulder_lift_joint', 'elbow_joint',
-            'wrist_1_joint', 'wrist_2_joint', 'wrist_3_joint'
-        ]
-        # traj.points.append(self.goals[0])
+        traj.joint_names = list(self.JOINT_NAMES)
         point = JointTrajectoryPoint()
-        point.positions = joint_list
-        point.velocities = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-        point.time_from_start = Duration(sec=4)
+        point.positions = joint_positions
+        point.velocities = [0.0] * len(joint_positions)
+        point.time_from_start = Duration(sec=duration_sec)
         traj.points.append(point)
-        # traj.header.stamp = rclpy.ti
-        traj.header.frame_id = 'base'
+        traj.header.frame_id = "base"
         self.publisher.publish(traj)
 
-    def send_joint_trajectory(self, jnt_traj
-                              # ts_sample, qs_sample, qds_sample, qdds_sample,
-                              # current_cfg
-                              ):
+    def send_joint_trajectory(self, jnt_traj) -> None:
+        """Send a time-parameterized trajectory via topic."""
         traj = JointTrajectory()
-        traj.joint_names = [
-            'shoulder_pan_joint', 'shoulder_lift_joint', 'elbow_joint',
-            'wrist_1_joint', 'wrist_2_joint', 'wrist_3_joint'
-        ]
+        traj.joint_names = list(self.JOINT_NAMES)
 
-        # Sample the time-parameterized trajectory
         duration = jnt_traj.duration
-        ts_sample = np.linspace(0, duration, int(duration / 0.01))  # 100 Hz sampling
+        ts_sample = np.linspace(0, duration, int(duration / 0.01))  # 100 Hz
         qs_sample = jnt_traj(ts_sample)
-        qds_sample = jnt_traj(ts_sample, 1)  # First derivative
-        qdds_sample = jnt_traj(ts_sample, 2)  # Second derivative
+        qds_sample = jnt_traj(ts_sample, 1)
+        qdds_sample = jnt_traj(ts_sample, 2)
 
-        # Add trajectory points with offset time
         for t, q, dq, ddq in zip(ts_sample, qs_sample, qds_sample, qdds_sample):
             point = JointTrajectoryPoint()
             point.positions = list(q)
@@ -174,395 +137,480 @@ class PublisherJointTrajectory(Node):
             point.time_from_start = rclDuration(seconds=t).to_msg()
             traj.points.append(point)
 
-        # traj.header.frame_id = 'base'
         self.publisher.publish(traj)
 
 
-def main():
-    """Main function for online planning with collision."""
-    rclpy.init()
-    node = PublisherJointTrajectory()
-    node.send_topic([-0.523, -1.61, 1.544, -1.5, -1.57, -0.5])
-    urdf_path = str(Path(__file__).parent / '../ur5e/ur5e.urdf.sphere')
-    target_link_name = 'tool0'
-    urdf = yourdfpy.URDF.load(urdf_path)
-    sphere_json_path = Path(__file__).parent / "../ur5e/ur5e.urdf_spherized.json"
-    with open(sphere_json_path, "r") as f:
-        sphere_decomposition = json.load(f)
-    robot_coll = pk.collision.RobotCollision.from_sphere_decomposition(
-        sphere_decomposition=sphere_decomposition,
-        urdf=urdf,
-    )
-    # For UR5 it's important to initialize the robot in a safe configuration;
-    # the zero-configuration puts the robot aligned with the wall obstacle.
-    # default_cfg = np.array([0, -1.57, 0, -1.57, 0, 0])
-    default_cfg = np.array([-0.523, -1.61, 1.544, -1.5, -1.57, -0.5])
-    robot = pk.Robot.from_urdf(urdf, default_joint_cfg=default_cfg)
+# ---------------------------------------------------------------------------
+# Main application
+# ---------------------------------------------------------------------------
 
-    plane_coll = HalfSpace.from_point_and_normal(
-        np.array([0.0, 0.0, 0.0]), np.array([0.0, 0.0, 1.0])
-    )
+class OnlinePlanningApp:
+    """Online planning application with Viser visualization and ROS2 control."""
 
-    # Define the online planning parameters.
-    len_traj, dt = 10, 0.3
+    def __init__(self, cfg: Config, node: JointTrajectoryPublisher):
+        self.cfg = cfg
+        self.node = node
 
-    # Set up visualizer.
-    server = viser.ViserServer()
-    server.scene.add_grid("/ground", width=2, height=2, cell_size=0.1)
-    server.gui.configure_theme(dark_mode=True)
-    urdf_vis = ViserUrdf(server, urdf, root_node_name="/robot")
-    urdf_vis_mc = ViserUrdf(server, urdf, root_node_name="/robot_mc",
-                            mesh_color_override=(0.3, 0.3, 0.8, 0.5))
-    urdf_vis_mc.update_cfg(default_cfg)
-    current_mc_cfg = default_cfg.copy()
+        # --- Robot setup ---
+        self.urdf = yourdfpy.URDF.load(cfg.urdf_path)
+        with open(cfg.sphere_json_path) as f:
+            sphere_decomposition = json.load(f)
+        self.robot_coll = RobotCollision.from_sphere_decomposition(
+            sphere_decomposition=sphere_decomposition,
+            urdf=self.urdf,
+        )
+        self.default_cfg = np.array(cfg.default_cfg)
+        self.robot = pk.Robot.from_urdf(self.urdf, default_joint_cfg=self.default_cfg)
 
-    with server.gui.add_folder("Joint   position", expand_by_default=False):
-        (slider_handles, initial_config) = create_robot_control_sliders(
-            server, urdf_vis
+        # --- Collision objects ---
+        self.plane_coll = HalfSpace.from_point_and_normal(
+            np.array([0.0, 0.0, 0.0]), np.array([0.0, 0.0, 1.0])
+        )
+        self.box_mesh = trimesh.load_mesh(cfg.box_stl_path)
+        self.box_mesh.apply_scale(0.005)
+        pts, radius = sample_even_fit_mesh(
+            self.box_mesh, n_spheres=cfg.box_n_spheres, sphere_radius=cfg.box_sphere_radius
+        )
+        self.box_spheres = pk.collision.Sphere.from_center_and_radius(
+            center=pts, radius=radius
         )
 
-    # Create interactive controller for IK target.
-    ik_target_handle = server.scene.add_transform_controls(
-        "/ik_target", scale=0.2,
-        # position=(0.3, 0.0, 0.5), wxyz=(0, 0, 1, 0)
-        position=(0.3398, -0.12158905, 0.5132406), wxyz=(0, 0.707, -0.707, 0)
-    )
-
-    target_frame_handle = server.scene.add_batched_axes(
-        "target_frame",
-        axes_length=0.05,
-        axes_radius=0.005,
-        batched_positions=np.zeros((25, 3)),
-        batched_wxyzs=np.array([[1.0, 0.0, 0.0, 0.0]] * 25),
-    )
-
-    with server.gui.add_folder("ik weights"):
-        rest_weight = server.gui.add_slider(
-            # "Rest Weight", 0.0, 0.5, 0.01, 0.02
-            # "Rest Weight", 0.0, 0.5, 0.01, 0.5
-            "Rest Weight", 0.0, 30.0, 1.0, 0.0,
+        # --- Planning state ---
+        self.sol_traj = np.array(
+            self.robot.joint_var_cls.default_factory()[None].repeat(cfg.len_traj, axis=0)
         )
-        pose_weight = server.gui.add_slider(
-            "Pose Weight", 5.0, 100.0, 1.0, 19.0
+        self.current_mc_cfg = self.default_cfg.copy()
+        self.is_executing = False       # ボタンを押すまで待機
+        self.traj_index = 0
+        self._pending_traj = None       # 確認待ち軌道
+        self._pending_sol_traj = None   # 確認待ちsol_traj
+        self._waiting_confirmation = False  # 確認待ちフラグ
+        self._traj_confirmed = False    # 送信確定フラグ
+        self._confirm_folder: Optional[viser.GuiFolderHandle] = None  # 確認パネル
+
+        # --- Viser setup ---
+        self.server = viser.ViserServer(port=cfg.viser_port)
+        self.server.gui.configure_theme(dark_mode=True)
+        self._setup_scene()
+        self._setup_gui()
+
+    # ------------------------------------------------------------------
+    # Scene setup
+    # ------------------------------------------------------------------
+
+    def _setup_scene(self) -> None:
+        """3Dシーンのセットアップ."""
+        self.server.scene.add_grid("/ground", width=2, height=2, cell_size=0.1)
+
+        self.urdf_vis = ViserUrdf(self.server, self.urdf, root_node_name="/robot")
+        self.urdf_vis_mc = ViserUrdf(
+            self.server, self.urdf, root_node_name="/robot_mc",
+            mesh_color_override=(0.3, 0.3, 0.8, 0.5),
+        )
+        self.urdf_vis_mc.update_cfg(self.default_cfg)
+
+        self.ik_target_handle = self.server.scene.add_transform_controls(
+            "/ik_target", scale=0.2,
+            position=(0.3398, -0.12158905, 0.5132406),
+            wxyz=(0, 0.707, -0.707, 0),
+        )
+        self.ik_target_handle.on_update(self._on_ik_target_update)
+
+        self.target_frame_handle = self.server.scene.add_batched_axes(
+            "target_frame",
+            axes_length=0.05,
+            axes_radius=0.005,
+            batched_positions=np.zeros((self.cfg.len_traj, 3)),
+            batched_wxyzs=np.array([[1.0, 0.0, 0.0, 0.0]] * self.cfg.len_traj),
         )
 
-        collision_weight = server.gui.add_slider(
-            "Collision Weight", 0.0, 30.0, 1.0, 15.0
+        self.box_handle = self.server.scene.add_transform_controls(
+            "/box", scale=0.2,
+            wxyz=(0.707, 0.707, 0, 0),
+            position=(5.07658497e-01, -7.54795097e-01, 1.37389611e-04),
+        )
+        self.server.scene.add_mesh_trimesh("/box/visual", mesh=self.box_mesh)
+        self.server.scene.add_mesh_trimesh(
+            "/box/coll", mesh=self.box_spheres.to_trimesh()
         )
 
-        elbow_height_weight = server.gui.add_slider(
-            "Elbow Height Weight", 0.0, 10.0, 0.001, 0.25
+    # ------------------------------------------------------------------
+    # GUI setup
+    # ------------------------------------------------------------------
+
+    def _setup_gui(self) -> None:
+        """GUIのセットアップ."""
+        with self.server.gui.add_folder("Joint position", expand_by_default=False):
+            self.slider_handles, _ = self._create_robot_control_sliders()
+
+        with self.server.gui.add_folder("IK Weights"):
+            self.rest_weight = self.server.gui.add_slider(
+                "Rest Weight", 0.0, 30.0, 1.0, 0.0
+            )
+            self.pose_weight = self.server.gui.add_slider(
+                "Pose Weight", 5.0, 100.0, 1.0, 19.0
+            )
+            self.collision_weight = self.server.gui.add_slider(
+                "Collision Weight", 0.0, 30.0, 1.0, 15.0
+            )
+            self.elbow_height_weight = self.server.gui.add_slider(
+                "Elbow Height Weight", 0.0, 10.0, 0.001, 0.25
+            )
+            self.realtime_ik = self.server.gui.add_checkbox(
+                "Enable realtime IK", initial_value=True
+            )
+
+        with self.server.gui.add_folder("Cost Weights"):
+            with self.server.gui.add_folder("Pose Costs"):
+                self.w_pose_rot = self.server.gui.add_slider(
+                    "Pose Match Rotation", 0.0, 200.0, 1.0, 100.0
+                )
+                self.w_pose_trans = self.server.gui.add_slider(
+                    "Pose Match Translation", 0.0, 400.0, 1.0, 100.0
+                )
+                self.w_pose_smooth = self.server.gui.add_slider(
+                    "Pose Smoothness", 0.0, 100.0, 0.1, 10.0
+                )
+                self.w_match_start = self.server.gui.add_slider(
+                    "Match Start Pose", 0.0, 200.0, 1.0, 100.0
+                )
+                self.w_match_joint = self.server.gui.add_slider(
+                    "Match Joint to Pose", 0.0, 200.0, 1.0, 100.0
+                )
+
+            with self.server.gui.add_folder("Joint Costs"):
+                self.w_smooth = self.server.gui.add_slider(
+                    "Smoothness", 0.0, 50.0, 1.0, 1.0
+                )
+                self.w_limit_vel = self.server.gui.add_slider(
+                    "Limit Velocity", 0.0, 10.0, 0.1, 0.0
+                )
+                self.w_limit = self.server.gui.add_slider(
+                    "Joint Limit", 0.0, 200.0, 1.0, 100.0
+                )
+                self.w_rest = self.server.gui.add_slider(
+                    "Rest Pose", 0.0, 1.0, 0.01, 0.0
+                )
+                self.w_manip = self.server.gui.add_slider(
+                    "Manipulability", 0.0, 1.0, 0.01, 0.0
+                )
+
+            with self.server.gui.add_folder("Collision Costs"):
+                self.w_self_coll = self.server.gui.add_slider(
+                    "Self Collision", 0.0, 50.0, 1.0, 0.0
+                )
+                self.w_world_coll = self.server.gui.add_slider(
+                    "World Collision", 0.0, 100.0, 1.0, 21.0
+                )
+
+        self.speed_percentage = self.server.gui.add_slider(
+            "Speed percentage", 0.1, 1.0, 0.1, 0.5
+        )
+        self.time_step = self.server.gui.add_slider(
+            "Timestep", min=0, max=self.cfg.len_traj - 1, step=1, initial_value=0
+        )
+        self.time_step.on_update(
+            lambda _: self.urdf_vis_mc.update_cfg(
+                np.array(self.sol_traj[self.time_step.value])
+            )
+        )
+        self.plan_button = self.server.gui.add_button(label="Planning")
+        self.plan_button.on_click(self._on_plan_click)
+
+        self._update_robot_visualization(self.sol_traj[0])
+
+    def _create_robot_control_sliders(self) -> tuple:
+        """ロボット制御スライダーを作成."""
+        slider_handles = []
+        initial_config = []
+        for joint_name, (lower, upper) in self.urdf_vis.get_actuated_joint_limits().items():
+            lower = lower if lower is not None else -np.pi
+            upper = upper if upper is not None else np.pi
+            initial_pos = 0.0 if lower < -0.1 and upper > 0.1 else (lower + upper) / 2.0
+            slider = self.server.gui.add_slider(
+                label=joint_name, min=lower, max=upper, step=1e-3,
+                initial_value=initial_pos,
+            )
+            slider_handles.append(slider)
+            initial_config.append(initial_pos)
+        return slider_handles, initial_config
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _update_robot_visualization(self, config: np.ndarray) -> None:
+        """ロボットURDF・スライダー・衝突メッシュを更新."""
+        self.urdf_vis.update_cfg(config)
+        for slider, value in zip(self.slider_handles, config):
+            slider.value = float(value)
+        robot_coll_mesh = self.robot_coll.at_config(self.robot, config).to_trimesh()
+        self.server.scene.add_mesh_trimesh(
+            "/robot_coll", mesh=robot_coll_mesh, visible=True
         )
 
-        realtime_ik = server.gui.add_checkbox("Enable realtime ik", initial_value=True)
+    def _get_world_coll(self) -> list:
+        """現在のボックス位置から障害物リストを取得."""
+        box_coll = self.box_spheres.transform_from_wxyz_position(
+            wxyz=np.array(self.box_handle.wxyz),
+            position=np.array(self.box_handle.position),
+        )
+        return [self.plane_coll, box_coll]
 
-    # Create weight sliders for cost functions
-    with server.gui.add_folder("Cost Weights"):
-        with server.gui.add_folder("Pose Costs"):
-            weight_pose_match_rotation = server.gui.add_slider(
-                label="Pose Match Rotation",
-                min=0.0,
-                max=200.0,
-                step=1.0,
-                initial_value=100.0,
-            )
-            weight_pose_match_translation = server.gui.add_slider(
-                label="Pose Match Translation",
-                min=0.0,
-                max=400.0,
-                step=1.0,
-                initial_value=100.0,
-            )
-            weight_pose_smoothness = server.gui.add_slider(
-                label="Pose Smoothness",
-                min=0.0,
-                max=100.0,
-                step=0.1,
-                initial_value=10.0,
-            )
-            weight_match_start_pose = server.gui.add_slider(
-                label="Match Start Pose",
-                min=0.0,
-                max=200.0,
-                step=1.0,
-                initial_value=100.0,
-            )
-            weight_match_joint_to_pose = server.gui.add_slider(
-                label="Match Joint to Pose",
-                min=0.0,
-                max=200.0,
-                step=1.0,
-                initial_value=100.0,
-            )
+    def _get_rest_weights(self) -> np.ndarray:
+        """rest weightの配列を生成."""
+        weights = np.array(
+            [self.rest_weight.value] * self.robot.joints.num_actuated_joints
+        )
+        weights[0] = 0  # allow joint rotation freely
+        return weights
 
-        with server.gui.add_folder("Joint Costs"):
-            weight_smoothness = server.gui.add_slider(
-                label="Smoothness",
-                min=0.0,
-                max=50.0,
-                step=1.0,
-                initial_value=1.0,
+    def _run_ik(self, world_coll_list: list) -> Optional[np.ndarray]:
+        """IKを解いて関節角度を返す。失敗時はNoneを返す。"""
+        weights = np.ones(len(world_coll_list)) * self.collision_weight.value
+        try:
+            return pks.solve_ik_with_collision_custom(
+                robot=self.robot,
+                coll=self.robot_coll,
+                world_coll_list=world_coll_list,
+                target_link_name=self.cfg.target_link_name,
+                target_position=np.array(self.ik_target_handle.position),
+                target_wxyz=np.array(self.ik_target_handle.wxyz),
+                weights=weights,
+                pose_weight=self.pose_weight.value,
+                rest_weight=self._get_rest_weights(),
+                initial_joint_angles=self.current_mc_cfg,
+                elbow_height_weight=self.elbow_height_weight.value,
+                elbow_link_name=self.cfg.elbow_link_name,
             )
-            weight_limit_velocity = server.gui.add_slider(
-                label="Limit Velocity",
-                min=0.0,
-                max=10.0,
-                step=0.1,
-                initial_value=0.0,
-            )
-            weight_limit = server.gui.add_slider(
-                label="Joint Limit",
-                min=0.0,
-                max=200.0,
-                step=1.0,
-                initial_value=100.0,
-            )
-            weight_rest = server.gui.add_slider(
-                label="Rest Pose",
-                min=0.0,
-                max=1.0,
-                step=0.01,
-                initial_value=0.0,
-            )
-            weight_manipulability = server.gui.add_slider(
-                label="Manipulability",
-                min=0.0,
-                max=1.0,
-                step=0.01,
-                initial_value=0.0,
-            )
+        except (ValueError, RuntimeError) as e:
+            print(f"IK solver failed: {e}")
+            return None
 
-        with server.gui.add_folder("Collision Costs"):
-            weight_self_collision = server.gui.add_slider(
-                label="Self Collision",
-                min=0.0,
-                max=50.0,
-                step=1.0,
-                initial_value=0.0,
-            )
-            weight_world_collision = server.gui.add_slider(
-                label="World Collision",
-                min=0.0,
-                max=100.0,
-                step=1.0,
-                initial_value=21.0,
-            )
+    # ------------------------------------------------------------------
+    # Callbacks
+    # ------------------------------------------------------------------
 
-    sol_traj = np.array(
-        robot.joint_var_cls.default_factory()[None].repeat(len_traj, axis=0)
-    )
-    update_robot_visualization(
-        urdf_vis, slider_handles, robot, robot_coll, server, sol_traj[0]
-    )
+    def _on_ik_target_update(self, _: viser.TransformControlsHandle) -> None:
+        """IKターゲット更新コールバック."""
+        if not self.realtime_ik.value:
+            return
+        ik_sol = self._run_ik(self._get_world_coll())
+        if ik_sol is not None:
+            self.urdf_vis_mc.update_cfg(ik_sol)
+            self.current_mc_cfg = ik_sol.copy()
 
-    target_link_idx = robot.links.names.index(target_link_name)
-    target_link_pose = robot.forward_kinematics(sol_traj)[target_link_idx]
-    print(f'target_link_pose initial: {target_link_pose}')
-
-    mesh = trimesh.load_mesh(str(Path(__file__).parent / 'storage_box.stl'))
-    mesh.apply_scale(0.005)
-    box_handle = server.scene.add_transform_controls(
-        "/box", scale=0.2,
-        wxyz=(0.707, 0.707, 0, 0),
-        position=(5.07658497e-01, -7.54795097e-01,  1.37389611e-04),
-    )
-    server.scene.add_mesh_trimesh("/box/visual", mesh=mesh)
-    # pts, radius = voxel_fit_volume_sample_surface_mesh(mesh, n_spheres=500, surface_sphere_radius=0.005)
-    pts, radius = sample_even_fit_mesh(mesh, n_spheres=500, sphere_radius=0.005)
-    # print(f'{type(pts)=}, {pts=}')
-    box_spheres = pk.collision.Sphere.from_center_and_radius(
-        center=pts, radius=radius)
-    server.scene.add_mesh_trimesh(
-        "/box/coll", mesh=box_spheres.to_trimesh(),
-    )
-
-    # Get current configuration from sliders
-    current_cfg = np.array([slider.value for slider in slider_handles])
-    sol_traj = np.array([current_cfg] * len_traj)
-    qs_sample = sol_traj.copy()
-    # sol_traj_init = np.array([current_cfg] * len_traj)
-
-    is_executing = True
-    traj_index = 0
-
-    speed_percentage = server.gui.add_slider(
-        label="Speed percentage",
-        min=0.0,
-        max=1.0,
-        step=0.1,
-        initial_value=0.5,
-    )
-
-    plan_button = server.gui.add_button(
-        label="Planning",
-    )
-
-    @plan_button.on_click
-    def _(_) -> None:
-        nonlocal is_executing, traj_index
-        if not is_executing:
-            is_executing = True
-            traj_index = 0
-            plan_button.name = "Planning..."
+    def _on_plan_click(self, _) -> None:
+        """Planning ボタンコールバック."""
+        if self._waiting_confirmation:
+            return  # モーダル確認中は無視
+        if self.is_executing:
+            # 実行中なら停止
+            self.is_executing = False
+            self.traj_index = 0
+            self.plan_button.label = "Start Planning"
         else:
-            is_executing = False
-            plan_button.name = "Start Planning"
+            # 停止中なら計画開始
+            self.is_executing = True
+            self.traj_index = 0
+            self.plan_button.label = "Planning..."
 
-    # Add callback when IK target is moved
+    # ------------------------------------------------------------------
+    # Planning and execution
+    # ------------------------------------------------------------------
 
-    time_step = server.gui.add_slider(
-        "Timestep", min=0, max=len_traj - 1, step=1, initial_value=0
-    )
-    time_step.on_update(  # When sliders move, we update the URDF configuration.
-        lambda _:  urdf_vis_mc.update_cfg(
-            np.array([value for value in sol_traj[time_step.value]])
+    def _plan_trajectory(self, start_cfg: np.ndarray) -> np.ndarray:
+        """軌道を計画してsol_trajを返す。"""
+        world_coll_list = self._get_world_coll()
+        print(f"Box position: {self.box_handle.position}, wxyz: {self.box_handle.wxyz}")
+
+        prev_sols_interp = np.linspace(
+            start_cfg, self.current_mc_cfg, self.cfg.len_traj + 1
+        )[1:]
+
+        print("Planning trajectory...")
+        sol_traj, sol_pos, sol_wxyz = pks.wu_solve_online_planning(
+            robot=self.robot,
+            robot_coll=self.robot_coll,
+            world_coll=world_coll_list,
+            target_link_name=self.cfg.target_link_name,
+            target_position=np.array(self.ik_target_handle.position),
+            target_wxyz=np.array(self.ik_target_handle.wxyz),
+            timesteps=self.cfg.len_traj,
+            dt=self.cfg.dt,
+            start_cfg=start_cfg,
+            prev_sols=prev_sols_interp,
+            weight_pose_match_rotation=self.w_pose_rot.value,
+            weight_pose_match_translation=self.w_pose_trans.value,
+            weight_pose_smoothness=self.w_pose_smooth.value,
+            weight_match_start_pose=self.w_match_start.value,
+            weight_match_joint_to_pose=self.w_match_joint.value,
+            weight_smoothness=self.w_smooth.value,
+            weight_limit_velocity=self.w_limit_vel.value,
+            weight_limit=self.w_limit.value,
+            weight_rest=self.w_rest.value,
+            weight_manipulability=self.w_manip.value,
+            weight_self_collision=self.w_self_coll.value,
+            weight_world_collision=self.w_world_coll.value,
         )
-    )
 
-    """Callback when IK target is updated. warm up"""
-    box_coll_world_current = box_spheres.transform_from_wxyz_position(
-        wxyz=np.array(box_handle.wxyz),
-        position=np.array(box_handle.position),
-    )
-    world_coll_list = [plane_coll, box_coll_world_current]
-    weights = np.ones(len(world_coll_list)) * collision_weight.value
-    rest_weights = np.array([rest_weight.value] * robot.joints.num_actuated_joints)
-    rest_weights[0] = 0  # allow joint rotation intensly
-    if realtime_ik.value:
-        # Realtime IK mode
-        ik_sol = pks.solve_ik_with_collision_custom(
-            robot=robot,
-            coll=robot_coll,
-            world_coll_list=world_coll_list,
-            target_link_name=target_link_name,
-            target_position=np.array(ik_target_handle.position),
-            target_wxyz=np.array(ik_target_handle.wxyz),
-            weights=weights,
-            pose_weight=pose_weight.value,
-            rest_weight=rest_weights,
-            initial_joint_angles=current_mc_cfg,
-            elbow_height_weight=elbow_height_weight.value,
-            elbow_link_name='forearm_link',
+        if hasattr(self.target_frame_handle, "batched_positions"):
+            self.target_frame_handle.batched_positions = np.array(sol_pos)
+            self.target_frame_handle.batched_wxyzs = np.array(sol_wxyz)
+        else:
+            self.target_frame_handle.positions_batched = np.array(sol_pos)
+            self.target_frame_handle.wxyzs_batched = np.array(sol_wxyz)
+
+        return sol_traj
+
+    def _send_trajectory_to_robot(
+        self, sol_traj: np.ndarray, start_cfg: np.ndarray
+    ) -> None:
+        """TOPPRAで時間最適化し、確認モーダルを表示する."""
+        dof = len(start_cfg)
+        spd = self.speed_percentage.value
+        vel_limits = np.ones(dof) * 3.14 * spd
+        acc_limits = np.ones(dof) * 14.0 * spd
+        self._pending_traj = generate_optimal_trajectory(
+            np.vstack([start_cfg, sol_traj]), vel_limits, acc_limits
         )
-        urdf_vis_mc.update_cfg(ik_sol)
-        current_mc_cfg = ik_sol.copy()
+        self._pending_sol_traj = sol_traj
+        self._waiting_confirmation = True
+        self._traj_confirmed = False
+        self._show_send_confirmation_panel()
 
-    @ik_target_handle.on_update
-    def _(_: viser.TransformControlsHandle) -> None:
-        nonlocal current_mc_cfg
-        """Callback when IK target is updated."""
-        box_coll_world_current = box_spheres.transform_from_wxyz_position(
-            wxyz=np.array(box_handle.wxyz),
-            position=np.array(box_handle.position),
+    def _close_confirm_panel(self) -> None:
+        """確認パネルを閉じる."""
+        if self._confirm_folder is not None:
+            self._confirm_folder.remove()
+            self._confirm_folder = None
+
+    def _show_send_confirmation_panel(self) -> None:
+        """軌道送信前の確認パネルをGUIサイドバーに表示（ビューポート操作を妨げない）."""
+        traj = self._pending_traj
+        sol_traj = self._pending_sol_traj
+
+        # 軌道の概要情報を作成
+        duration = traj.duration
+        n_steps = len(sol_traj)
+        target_pos = np.array(self.ik_target_handle.position)
+        target_link_idx = self.robot.links.names.index(self.cfg.target_link_name)
+        end_fk = self.robot.forward_kinematics(sol_traj[-1])
+        end_pos = np.array(end_fk[target_link_idx][4:])
+        final_dist = float(np.linalg.norm(end_pos - target_pos))
+
+        summary = (
+            f"**軌道をロボットに送信しますか？**\n\n"
+            f"- Duration: **{duration:.2f} s**\n"
+            f"- Steps: **{n_steps}**\n"
+            f"- Speed: **{self.speed_percentage.value * 100:.0f}%**\n"
+            f"- Target distance: **{final_dist:.4f} m**"
         )
-        world_coll_list = [plane_coll, box_coll_world_current]
-        weights = np.ones(len(world_coll_list)) * collision_weight.value
-        rest_weights = np.array([rest_weight.value] * robot.joints.num_actuated_joints)
-        rest_weights[0] = 0  # allow joint rotation intensly
-        if realtime_ik.value:
-            # Realtime IK mode
-            try:
-                ik_sol = pks.solve_ik_with_collision_custom(
-                    robot=robot,
-                    coll=robot_coll,
-                    world_coll_list=world_coll_list,
-                    target_link_name=target_link_name,
-                    target_position=np.array(ik_target_handle.position),
-                    target_wxyz=np.array(ik_target_handle.wxyz),
-                    weights=weights,
-                    pose_weight=pose_weight.value,
-                    rest_weight=rest_weights,
-                    initial_joint_angles=current_mc_cfg,
-                    elbow_height_weight=elbow_height_weight.value,
-                    elbow_link_name='forearm_link',
-                )
-                urdf_vis_mc.update_cfg(ik_sol)
-                current_mc_cfg = ik_sol.copy()
-            except (ValueError, RuntimeError) as e:
-                print(f"IK solver failed: {e}")
-                print("Keeping previous configuration")
-                # Keep current_mc_cfg unchanged
 
-    while True:
-        # Offline execution mode
-        if is_executing:
-            if traj_index == 0:
-                # Plan once at the beginning
-                current_cfg = np.array([slider.value for slider in slider_handles])
-                box_coll_world_current = box_spheres.transform_from_wxyz_position(
-                    wxyz=np.array(box_handle.wxyz),
-                    position=np.array(box_handle.position),
-                )
-                print(f'Box position: {box_handle.position}, wxyz: {box_handle.wxyz}')
-                world_coll_list = [plane_coll,
-                                   box_coll_world_current]
+        # 既存の確認パネルがあれば削除
+        self._close_confirm_panel()
 
-                # Linear interpolation from current_cfg to current_mc_cfg
-                prev_sols_interp = np.linspace(current_cfg, current_mc_cfg, len_traj + 1)[1:]
+        # GUIパネルに確認フォルダーを追加（order=-1で最上部に表示）
+        self._confirm_folder = self.server.gui.add_folder(
+            "⚠️ 送信確認", expand_by_default=True, order=-1.0
+        )
+        with self._confirm_folder:
+            self.server.gui.add_markdown(summary)
 
-                print("Planning trajectory...")
-                sol_traj, sol_pos, sol_wxyz = pks.wu_solve_online_planning(
-                    robot=robot,
-                    robot_coll=robot_coll,
-                    world_coll=world_coll_list,
-                    target_link_name=target_link_name,
-                    target_position=np.array(ik_target_handle.position),
-                    target_wxyz=np.array(ik_target_handle.wxyz),
-                    timesteps=len_traj,
-                    dt=dt,
-                    start_cfg=current_cfg,
-                    prev_sols=prev_sols_interp,
-                    weight_pose_match_rotation=weight_pose_match_rotation.value,
-                    weight_pose_match_translation=weight_pose_match_translation.value,
-                    weight_pose_smoothness=weight_pose_smoothness.value,
-                    weight_match_start_pose=weight_match_start_pose.value,
-                    weight_match_joint_to_pose=weight_match_joint_to_pose.value,
-                    weight_smoothness=weight_smoothness.value,
-                    weight_limit_velocity=weight_limit_velocity.value,
-                    weight_limit=weight_limit.value,
-                    weight_rest=weight_rest.value,
-                    weight_manipulability=weight_manipulability.value,
-                    weight_self_collision=weight_self_collision.value,
-                    weight_world_collision=weight_world_collision.value,
-                )
+            def _on_send(_):
+                self._close_confirm_panel()
+                print("Sending trajectory to robot...")
+                self.node.send_joint_trajectory(traj)
+                print("Trajectory sent!")
+                self._traj_confirmed = True
+                self._waiting_confirmation = False
+                self.traj_index = 1  # 0のままだと再計画ループするので1に
 
-                dof = 6
-                max_vel = 3.14 * speed_percentage.value    # rad/s
-                max_acc = 14.0 * speed_percentage.value    # rad/s² (800 deg/s² = 14 rad/s²)
-                vel_limits = np.ones(dof) * max_vel
-                acc_limits = np.ones(dof) * max_acc
+            def _on_cancel(_):
+                self._close_confirm_panel()
+                self._traj_confirmed = False
+                self._waiting_confirmation = False
+                self.is_executing = False
+                self.plan_button.label = "Start Planning"
+                self.traj_index = 0
+                print("Trajectory send cancelled.")
+
+            self.server.gui.add_button("✅ 送信する", color="green").on_click(_on_send)
+            self.server.gui.add_button("❌ キャンセル", color="red").on_click(_on_cancel)
+
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
+
+    def run(self) -> None:
+        """メインループ."""
+        # Warm-up IK
+        ik_sol = self._run_ik(self._get_world_coll())
+        if ik_sol is not None:
+            self.urdf_vis_mc.update_cfg(ik_sol)
+            self.current_mc_cfg = ik_sol.copy()
+
+        target_link_idx = self.robot.links.names.index(self.cfg.target_link_name)
+
+        try:
+            while True:
+                # モーダル確認待ち中はメインループをスキップ
+                if self._waiting_confirmation:
+                    time.sleep(0.05)
+                    continue
+
+                if self.is_executing:
+                    if self.traj_index == 0:
+                        # 軌道を計画してモーダル表示（フラグを立てて次ループへ）
+                        start_cfg = np.array(
+                            [slider.value for slider in self.slider_handles]
+                        )
+                        self.sol_traj = self._plan_trajectory(start_cfg)
+                        self._send_trajectory_to_robot(self.sol_traj, start_cfg)
+                        # モーダルが表示されたので確認待ちに入る（次ループでskip）
+                        time.sleep(0.05)
+                        continue
+
+                    if self.traj_index < len(self.sol_traj):
+                        current_fk = self.robot.forward_kinematics(
+                            self.sol_traj[self.traj_index]
+                        )
+                        current_pos = current_fk[target_link_idx][4:]
+                        distance = np.linalg.norm(
+                            current_pos - np.array(self.ik_target_handle.position)
+                        )
+                        print(
+                            f"Step {self.traj_index}/{len(self.sol_traj)}: "
+                            f"distance={distance:.6f}"
+                        )
+                        self._update_robot_visualization(
+                            self.sol_traj[self.traj_index]
+                        )
+                        self.traj_index += 1
+                    else:
+                        self.is_executing = False
+                        self.plan_button.label = "Start Planning"
+                        print("Trajectory execution completed!")
+                        self.traj_index = 0
+
+                time.sleep(0.01)
+        except KeyboardInterrupt:
+            print("\nShutting down...")
 
 
-                traj = generate_optimal_trajectory(np.vstack([current_cfg, sol_traj]),
-                                                   vel_limits, acc_limits)
-                node.send_joint_trajectory(traj)
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
-                if hasattr(target_frame_handle, "batched_positions"):
-                    target_frame_handle.batched_positions = np.array(sol_pos)
-                    target_frame_handle.batched_wxyzs = np.array(sol_wxyz)
-                else:
-                    target_frame_handle.positions_batched = np.array(sol_pos)
-                    target_frame_handle.wxyzs_batched = np.array(sol_wxyz)
+def main(cfg: Config = Config()) -> None:
+    """Main function for online planning with ROS control."""
+    rclpy.init()
+    node = JointTrajectoryPublisher()
+    node.send_topic(list(cfg.default_cfg))
 
-            if traj_index < len(sol_traj):
-                # Calculate and print distance to target
-                target_link_idx = robot.links.names.index(target_link_name)
-                current_fk = robot.forward_kinematics(sol_traj[traj_index])
-                current_pos = current_fk[target_link_idx][4:]
-                target_pos = np.array(ik_target_handle.position)
-                distance = np.linalg.norm(current_pos - target_pos)
-                print(f'Step {traj_index}/{len(sol_traj)}: {distance=:.6f}')
-                update_robot_visualization(
-                    urdf_vis, slider_handles, robot, robot_coll, server, sol_traj[traj_index]
-                )
-                traj_index += 1
-            else:
-                # Finished executing
-                is_executing = False
-                plan_button.name = "Start Planning"
-                print("Trajectory execution completed!")
-                traj_index = 0
+    app = OnlinePlanningApp(cfg, node)
+    app.run()
 
 
 if __name__ == "__main__":
-    main()
+    tyro.cli(main)
