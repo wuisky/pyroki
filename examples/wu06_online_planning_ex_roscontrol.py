@@ -56,6 +56,7 @@ class Config:
     viser_port: int = 8080
     len_traj: int = 10
     dt: float = 0.3
+    import_box: bool = False
     box_stl_path: str = str(Path(__file__).parent / "storage_box.stl")
     box_n_spheres: int = 500
     box_sphere_radius: float = 0.005
@@ -150,6 +151,7 @@ class OnlinePlanningApp:
     def __init__(self, cfg: Config, node: JointTrajectoryPublisher):
         self.cfg = cfg
         self.node = node
+        self.box_mesh = None
 
         # --- Robot setup ---
         self.urdf = yourdfpy.URDF.load(cfg.urdf_path)
@@ -166,14 +168,15 @@ class OnlinePlanningApp:
         self.plane_coll = HalfSpace.from_point_and_normal(
             np.array([0.0, 0.0, 0.0]), np.array([0.0, 0.0, 1.0])
         )
-        self.box_mesh = trimesh.load_mesh(cfg.box_stl_path)
-        self.box_mesh.apply_scale(0.005)
-        pts, radius = sample_even_fit_mesh(
-            self.box_mesh, n_spheres=cfg.box_n_spheres, sphere_radius=cfg.box_sphere_radius
-        )
-        self.box_spheres = pk.collision.Sphere.from_center_and_radius(
-            center=pts, radius=radius
-        )
+        if cfg.import_box:
+            self.box_mesh = trimesh.load_mesh(cfg.box_stl_path)
+            self.box_mesh.apply_scale(0.005)
+            pts, radius = sample_even_fit_mesh(
+                self.box_mesh, n_spheres=cfg.box_n_spheres, sphere_radius=cfg.box_sphere_radius
+            )
+            self.box_spheres = pk.collision.Sphere.from_center_and_radius(
+                center=pts, radius=radius
+            )
 
         # --- Planning state ---
         self.sol_traj = np.array(
@@ -224,15 +227,16 @@ class OnlinePlanningApp:
             batched_wxyzs=np.array([[1.0, 0.0, 0.0, 0.0]] * self.cfg.len_traj),
         )
 
-        self.box_handle = self.server.scene.add_transform_controls(
-            "/box", scale=0.2,
-            wxyz=(0.707, 0.707, 0, 0),
-            position=(5.07658497e-01, -7.54795097e-01, 1.37389611e-04),
-        )
-        self.server.scene.add_mesh_trimesh("/box/visual", mesh=self.box_mesh)
-        self.server.scene.add_mesh_trimesh(
-            "/box/coll", mesh=self.box_spheres.to_trimesh()
-        )
+        if self.box_mesh:
+            self.box_handle = self.server.scene.add_transform_controls(
+                "/box", scale=0.2,
+                wxyz=(0.707, 0.707, 0, 0),
+                position=(5.07658497e-01, -7.54795097e-01, 1.37389611e-04),
+            )
+            self.server.scene.add_mesh_trimesh("/box/visual", mesh=self.box_mesh)
+            self.server.scene.add_mesh_trimesh(
+                "/box/coll", mesh=self.box_spheres.to_trimesh()
+            )
 
     # ------------------------------------------------------------------
     # GUI setup
@@ -351,11 +355,14 @@ class OnlinePlanningApp:
 
     def _get_world_coll(self) -> list:
         """現在のボックス位置から障害物リストを取得."""
-        box_coll = self.box_spheres.transform_from_wxyz_position(
-            wxyz=np.array(self.box_handle.wxyz),
-            position=np.array(self.box_handle.position),
-        )
-        return [self.plane_coll, box_coll]
+        coll_list = [self.plane_coll]
+        if self.box_mesh:
+            box_coll = self.box_spheres.transform_from_wxyz_position(
+                wxyz=np.array(self.box_handle.wxyz),
+                position=np.array(self.box_handle.position),
+            )
+            coll_list.append(box_coll)
+        return coll_list
 
     def _get_rest_weights(self) -> np.ndarray:
         """rest weightの配列を生成."""
@@ -422,7 +429,6 @@ class OnlinePlanningApp:
     def _plan_trajectory(self, start_cfg: np.ndarray) -> np.ndarray:
         """軌道を計画してsol_trajを返す。"""
         world_coll_list = self._get_world_coll()
-        print(f"Box position: {self.box_handle.position}, wxyz: {self.box_handle.wxyz}")
 
         prev_sols_interp = np.linspace(
             start_cfg, self.current_mc_cfg, self.cfg.len_traj + 1
